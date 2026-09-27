@@ -11,6 +11,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -56,6 +58,9 @@ fun ScanScreen(
                 return@Column
             }
 
+            HeroBanner(scanned = allSongs.isNotEmpty())
+            Spacer(Modifier.height(16.dp))
+
             if (allSongs.isNotEmpty() && !scanning) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -77,12 +82,42 @@ fun ScanScreen(
                 Spacer(Modifier.height(16.dp))
             }
 
-            Card(shape = RoundedCornerShape(16.dp), elevation = CardDefaults.cardElevation(1.dp)) {
+            Card(
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
+                elevation = CardDefaults.cardElevation(1.dp)
+            ) {
                 Column(Modifier.padding(16.dp)) {
-                    Text("הגדרות סריקה", fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                    Spacer(Modifier.height(12.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(RoundedCornerShape(9.dp))
+                                .background(MaterialTheme.colorScheme.secondaryContainer),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Filled.Tune,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text("הגדרות סריקה", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    }
+                    Spacer(Modifier.height(14.dp))
 
-                    Text("סף דמיון בשם: ${(simThreshold * 100).toInt()}%", fontSize = 13.sp)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Filled.Percent,
+                            contentDescription = null,
+                            modifier = Modifier.size(15.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text("סף דמיון בשם: ${(simThreshold * 100).toInt()}%", fontSize = 13.sp)
+                    }
                     Slider(
                         value = simThreshold,
                         onValueChange = onSimThresholdChange,
@@ -91,7 +126,16 @@ fun ScanScreen(
                     )
 
                     Spacer(Modifier.height(4.dp))
-                    Text("טווח סטייה באורך: ${durTolerance.toInt()} שניות", fontSize = 13.sp)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Filled.Timer,
+                            contentDescription = null,
+                            modifier = Modifier.size(15.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text("טווח סטייה באורך: ${durTolerance.toInt()} שניות", fontSize = 13.sp)
+                    }
                     Slider(
                         value = durTolerance,
                         onValueChange = onDurToleranceChange,
@@ -106,9 +150,10 @@ fun ScanScreen(
             Button(
                 onClick = onScan,
                 enabled = !scanning,
+                shape = RoundedCornerShape(16.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(50.dp)
+                    .height(52.dp)
             ) {
                 if (scanning) {
                     CircularProgressIndicator(
@@ -188,9 +233,10 @@ fun ScanScreen(
                 Spacer(Modifier.height(16.dp))
                 Button(
                     onClick = onShowResults,
+                    shape = RoundedCornerShape(16.dp),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(50.dp),
+                        .height(52.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.tertiaryContainer,
                         contentColor = MaterialTheme.colorScheme.onTertiaryContainer
@@ -200,6 +246,55 @@ fun ScanScreen(
                     Spacer(Modifier.width(6.dp))
                     Icon(Icons.Filled.ChevronLeft, contentDescription = null)
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HeroBanner(scanned: Boolean) {
+    val gradient = Brush.linearGradient(
+        colors = listOf(
+            MaterialTheme.colorScheme.primary,
+            MaterialTheme.colorScheme.primary.copy(alpha = 0.75f)
+        )
+    )
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(22.dp))
+            .background(gradient)
+            .padding(18.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color.White.copy(alpha = 0.18f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Filled.AutoFixHigh,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+            Spacer(Modifier.width(14.dp))
+            Column {
+                Text(
+                    "נקה את ספריית השירים",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp
+                )
+                Text(
+                    if (scanned) "לחצו על \"סרוק את המכשיר\" כדי לרענן את הרשימה"
+                    else "מצא שירים כפולים ופנה מקום אחסון תוך שניות",
+                    color = Color.White.copy(alpha = 0.9f),
+                    fontSize = 12.sp
+                )
             }
         }
     }
@@ -251,7 +346,8 @@ private fun StatChip(
     Card(
         modifier = modifier,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
-        shape = RoundedCornerShape(14.dp)
+        elevation = CardDefaults.cardElevation(1.dp),
+        shape = RoundedCornerShape(16.dp)
     ) {
         Column(
             Modifier.padding(vertical = 10.dp, horizontal = 12.dp),

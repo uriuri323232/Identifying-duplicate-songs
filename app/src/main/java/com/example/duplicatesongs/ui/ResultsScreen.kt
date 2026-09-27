@@ -18,6 +18,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -97,7 +98,7 @@ fun ResultsScreen(
                 TopAppBar(
                     title = {
                         Column {
-                            Text("תוצאות")
+                            Text("תוצאות", fontWeight = FontWeight.Bold)
                             Text(
                                 "${groups.size} קבוצות · $totalDupSongs שירים · עד ${formatSize(totalWaste)} לשחרור",
                                 fontSize = 12.sp,
@@ -109,7 +110,11 @@ fun ResultsScreen(
                         IconButton(onClick = onBack) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "חזרה")
                         }
-                    }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        scrolledContainerColor = MaterialTheme.colorScheme.surface
+                    )
                 )
                 if (groups.isNotEmpty()) {
                     OutlinedTextField(
@@ -163,7 +168,7 @@ fun ResultsScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                OutlinedButton(onClick = onAutoSelect) {
+                OutlinedButton(onClick = onAutoSelect, shape = RoundedCornerShape(14.dp)) {
                     Icon(Icons.Filled.AutoFixHigh, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("סמן כפולים אוטומטית")
@@ -179,12 +184,14 @@ fun ResultsScreen(
             Button(
                 onClick = { confirmDelete = true },
                 enabled = selected.isNotEmpty(),
+                shape = RoundedCornerShape(14.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.error,
                     contentColor = MaterialTheme.colorScheme.onError
                 ),
                 modifier = Modifier
                     .fillMaxWidth()
+                    .height(48.dp)
                     .padding(bottom = 10.dp)
             ) {
                 Icon(Icons.Filled.DeleteOutline, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -280,37 +287,49 @@ private fun DuplicateGroupCard(
         modifier = Modifier
             .fillMaxWidth()
             .animateContentSize(),
-        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
-        shape = RoundedCornerShape(16.dp)
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        shape = RoundedCornerShape(20.dp)
     ) {
-        Column(Modifier.padding(12.dp)) {
+        Column(Modifier.padding(14.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        Icons.Filled.LibraryMusic,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(Modifier.width(6.dp))
+                    Box(
+                        modifier = Modifier
+                            .size(30.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(MaterialTheme.colorScheme.primaryContainer),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Filled.LibraryMusic,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
                     Text("${group.size} שירים דומים", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                 }
                 AssistChip(
                     onClick = {},
                     enabled = false,
-                    label = { Text("עד ${formatSize(waste)}", fontSize = 11.sp) },
+                    label = { Text("עד ${formatSize(waste)}", fontSize = 11.sp, fontWeight = FontWeight.SemiBold) },
                     colors = AssistChipDefaults.assistChipColors(
                         disabledLabelColor = WasteAmber,
-                        disabledContainerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.6f)
+                        disabledContainerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.7f)
                     ),
-                    border = null
+                    border = null,
+                    shape = RoundedCornerShape(10.dp)
                 )
             }
 
+            Spacer(Modifier.height(8.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
             Spacer(Modifier.height(4.dp))
 
             visibleSongs.forEach { song ->
@@ -394,13 +413,30 @@ private fun SongRow(
                 fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Text(
-                song.path,
-                fontSize = 11.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            Row(
+                verticalAlignment = Alignment.Top,
+                modifier = Modifier.padding(top = 3.dp)
+            ) {
+                Icon(
+                    Icons.Filled.FolderOpen,
+                    contentDescription = "מיקום הקובץ",
+                    modifier = Modifier
+                        .padding(top = 1.dp)
+                        .size(12.dp),
+                    tint = MaterialTheme.colorScheme.outline
+                )
+                Spacer(Modifier.width(4.dp))
+                // Full path shown without truncation, so the exact location of the
+                // file on the device is always visible - it wraps instead of ellipsizing.
+                Text(
+                    song.directory,
+                    fontSize = 10.sp,
+                    lineHeight = 13.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.outline,
+                    modifier = Modifier.weight(1f)
+                )
+            }
         }
 
         IconButton(onClick = onPlay) {

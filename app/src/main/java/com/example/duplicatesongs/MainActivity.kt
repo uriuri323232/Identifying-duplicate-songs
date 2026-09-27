@@ -45,6 +45,13 @@ data class Song(
     val uri: Uri get() = ContentUris.withAppendedId(
         MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id
     )
+
+    /** The folder the file lives in (path without the file name), for display purposes. */
+    val directory: String
+        get() {
+            val idx = path.lastIndexOf('/')
+            return if (idx > 0) path.substring(0, idx) else path
+        }
 }
 
 // ---------- Text normalization & similarity ----------
