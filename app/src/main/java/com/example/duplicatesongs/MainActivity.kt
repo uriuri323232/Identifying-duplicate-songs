@@ -1,7 +1,8 @@
 package com.example.duplicatesongs
 
-import android.app.RecoverableActionException
+import android.app.RecoverableSecurityException
 import android.content.ContentUris
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -12,6 +13,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -22,10 +24,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Info
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.Normalizer
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -37,6 +46,7 @@ data class Song(
     val title: String,
     val path: String,
     val durationSec: Long,
+    val sizeBytes: Long,
     val norm: String
 ) {
     val uri: Uri get() = ContentUris.withAppendedId(
@@ -56,9 +66,13 @@ fun normalizeTitle(raw: String): String {
     var s = raw.substringBeforeLast('.', raw) // drop extension if present
     s = Normalizer.normalize(s, Normalizer.Form.NFD).replace(Regex("\\p{Mn}+"), "")
     s = s.lowercase()
-    s = s.replace(Regex("\\([^)]*\\)|\\[[^]]*]|\\{[^}]*}"), " ")
+    // Remove content in brackets. Braces are escaped because Android's regex engine
+    // treats an unescaped { or } as a quantifier and throws a syntax error.
+    s = s.replace(Regex("\\([^)]*\\)"), " ")   // ( ... )
+    s = s.replace(Regex("\\[[^\\]]*\\]"), " ")  // [ ... ]
+    s = s.replace(Regex("\\{[^}]*\\}"), " ")    // { ... }
     for (w in NOISE_WORDS) {
-        s = s.replace(Regex("\\b$w\\b"), " ")
+        s = s.replace(Regex("\\b" + Regex.escape(w) + "\\b"), " ")
     }
     s = s.replace(Regex("[^a-z0-9\\u0590-\\u05ff]+"), " ").trim().replace(Regex("\\s+"), " ")
     return s
@@ -113,7 +127,8 @@ fun loadSongs(context: android.content.Context): List<Song> {
         MediaStore.Audio.Media._ID,
         MediaStore.Audio.Media.DISPLAY_NAME,
         MediaStore.Audio.Media.DATA,
-        MediaStore.Audio.Media.DURATION
+        MediaStore.Audio.Media.DURATION,
+        MediaStore.Audio.Media.SIZE
     )
     val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0"
     context.contentResolver.query(collection, projection, selection, null, null)?.use { cursor ->
@@ -121,12 +136,14 @@ fun loadSongs(context: android.content.Context): List<Song> {
         val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
         val dataCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
         val durCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
+        val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE)
         while (cursor.moveToNext()) {
             val id = cursor.getLong(idCol)
             val name = cursor.getString(nameCol) ?: continue
             val path = cursor.getString(dataCol) ?: name
             val durMs = cursor.getLong(durCol)
-            songs.add(Song(id, name, path, durMs / 1000, normalizeTitle(name)))
+            val size = cursor.getLong(sizeCol)
+            songs.add(Song(id, name, path, durMs / 1000, size, normalizeTitle(name)))
         }
     }
     return songs
@@ -135,15 +152,21 @@ fun loadSongs(context: android.content.Context): List<Song> {
 fun findDuplicateGroups(
     songs: List<Song>,
     simThreshold: Double,
-    durationToleranceSec: Long
+    durationToleranceSec: Long,
+    onProgress: (done: Int, total: Int) -> Unit = { _, _ -> }
 ): List<List<Song>> {
     val uf = UnionFind(songs.size)
-    for (i in songs.indices) {
-        for (j in i + 1 until songs.size) {
-            val a = songs[i]; val b = songs[j]
-            if (abs(a.durationSec - b.durationSec) > durationToleranceSec) continue
-            if (similarity(a.norm, b.norm) >= simThreshold) uf.union(i, j)
+    // Compare only songs with near durations: sort by duration and slide a window,
+    // so we avoid the full O(n^2) comparison on large libraries.
+    val order = songs.indices.sortedBy { songs[it].durationSec }
+    for (p in order.indices) {
+        val i = order[p]
+        for (q in p + 1 until order.size) {
+            val j = order[q]
+            if (songs[j].durationSec - songs[i].durationSec > durationToleranceSec) break
+            if (similarity(songs[i].norm, songs[j].norm) >= simThreshold) uf.union(i, j)
         }
+        onProgress(p + 1, order.size)
     }
     val groups = LinkedHashMap<Int, MutableList<Song>>()
     songs.forEachIndexed { idx, song ->
@@ -157,48 +180,109 @@ fun formatDuration(sec: Long): String {
     return "%d:%02d".format(m, s)
 }
 
+fun formatSize(bytes: Long): String = when {
+    bytes < 1024 -> "$bytes B"
+    bytes < 1024 * 1024 -> "%.0f KB".format(bytes / 1024.0)
+    bytes < 1024L * 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024))
+    else -> "%.2f GB".format(bytes / (1024.0 * 1024 * 1024))
+}
+
+/**
+ * For each group, marks all songs EXCEPT the "best" one (largest file = usually best
+ * quality) for deletion. Returns the set of song ids to delete.
+ */
+fun autoSelectDuplicates(groups: List<List<Song>>): Set<Long> {
+    val toDelete = HashSet<Long>()
+    for (group in groups) {
+        val keep = group.maxByOrNull { it.sizeBytes } ?: continue
+        for (song in group) if (song.id != keep.id) toDelete.add(song.id)
+    }
+    return toDelete
+}
+
 // ---------- Activity ----------
+
+// ---------- Crash log (shows the real error next launch instead of a silent close) ----------
+
+object CrashLog {
+    private const val FILE = "last_crash.txt"
+    fun install(ctx: android.content.Context) {
+        val app = ctx.applicationContext
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                val text = "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}) · " +
+                    "${Build.MANUFACTURER} ${Build.MODEL}\nThread: ${t.name}\n\n" +
+                    android.util.Log.getStackTraceString(e)
+                File(app.filesDir, FILE).writeText(text)
+            } catch (_: Throwable) {}
+            prev?.uncaughtException(t, e)
+        }
+    }
+    fun read(ctx: android.content.Context): String? =
+        File(ctx.filesDir, FILE).takeIf { it.exists() }?.let { runCatching { it.readText() }.getOrNull() }
+    fun clear(ctx: android.content.Context) { runCatching { File(ctx.filesDir, FILE).delete() } }
+}
 
 class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        CrashLog.install(this)
         super.onCreate(savedInstanceState)
-        setContent { AppRoot() }
+        val crash = CrashLog.read(this)
+        setContent { AppRoot(lastCrash = crash) }
     }
 }
 
+private enum class Screen { Scan, Results, About }
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AppRoot() {
+fun AppRoot(lastCrash: String? = null) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
 
+    var screen by remember { mutableStateOf(Screen.Scan) }
     var hasPermission by remember {
         mutableStateOf(hasAudioPermission(context))
     }
     var simThreshold by remember { mutableStateOf(0.8f) }
     var durTolerance by remember { mutableStateOf(3f) }
     var scanning by remember { mutableStateOf(false) }
+    var scanPhase by remember { mutableStateOf("") }
+    var scanProgress by remember { mutableStateOf(0f) } // 0f..1f, -1f = indeterminate
     var allSongs by remember { mutableStateOf<List<Song>>(emptyList()) }
     var groups by remember { mutableStateOf<List<List<Song>>>(emptyList()) }
     var selected by remember { mutableStateOf<Set<Long>>(emptySet()) }
-    var pendingDeleteUri by remember { mutableStateOf<Uri?>(null) }
+    var pendingDeleteIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
+    var errorMsg by remember { mutableStateOf<String?>(null) }
+    var showCrash by remember { mutableStateOf(lastCrash != null) }
+
+    if (showCrash && lastCrash != null) {
+        AlertDialog(
+            onDismissRequest = { showCrash = false; CrashLog.clear(context) },
+            title = { Text("האפליקציה נסגרה בגלל שגיאה") },
+            text = { Text(lastCrash.take(2000)) },
+            confirmButton = { TextButton(onClick = { showCrash = false; CrashLog.clear(context) }) { Text("סגור") } }
+        )
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted -> hasPermission = granted }
 
-    // Handles the "confirm delete" system dialog required on Android 10+ (API 29+)
+    fun removeIds(ids: Set<Long>) {
+        allSongs = allSongs.filterNot { it.id in ids }
+        groups = groups.map { g -> g.filterNot { it.id in ids } }.filter { it.size > 1 }
+        selected = selected - ids
+    }
+
+    // Handles the "confirm delete" system dialog required on Android 10+ (API 29+).
     val deleteRequestLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
-        if (result.resultCode == android.app.Activity.RESULT_OK) {
-            pendingDeleteUri?.let { uri ->
-                allSongs = allSongs.filterNot { it.uri == uri }
-                groups = groups.map { g -> g.filterNot { it.uri == uri } }.filter { it.size > 1 }
-            }
-        }
-        pendingDeleteUri = null
+        if (result.resultCode == android.app.Activity.RESULT_OK) removeIds(pendingDeleteIds)
+        pendingDeleteIds = emptySet()
     }
 
     fun requestPermission() {
@@ -211,112 +295,289 @@ fun AppRoot() {
 
     fun runScan() {
         scanning = true
+        errorMsg = null
+        scanProgress = -1f
+        scanPhase = "טוען את ספריית השירים..."
         scope.launch {
-            val songs = withContext(Dispatchers.IO) { loadSongs(context) }
-            val result = withContext(Dispatchers.Default) {
-                findDuplicateGroups(songs, simThreshold.toDouble(), durTolerance.toLong())
+            try {
+                val songs = withContext(Dispatchers.IO) { loadSongs(context) }
+
+                scanPhase = "משווה שירים..."
+                scanProgress = 0f
+                val progressCounter = AtomicInteger(0)
+                val progressTotal = AtomicInteger(songs.size.coerceAtLeast(1))
+
+                // A lightweight ticker updates the Compose state a few times a second
+                // instead of on every comparison, so the UI stays smooth.
+                val tickerJob = launch {
+                    while (isActive) {
+                        scanProgress = progressCounter.get().toFloat() / progressTotal.get()
+                        delay(80)
+                    }
+                }
+
+                val result = withContext(Dispatchers.Default) {
+                    findDuplicateGroups(songs, simThreshold.toDouble(), durTolerance.toLong()) { done, total ->
+                        progressCounter.set(done)
+                        progressTotal.set(total)
+                    }
+                }
+                tickerJob.cancel()
+                scanProgress = 1f
+
+                allSongs = songs
+                groups = result
+                selected = emptySet()
+                screen = if (result.isNotEmpty()) Screen.Results else Screen.Scan
+            } catch (e: Throwable) {
+                errorMsg = "שגיאה בסריקה: ${e.message ?: e.javaClass.simpleName}"
+            } finally {
+                scanning = false
             }
-            allSongs = songs
-            groups = result
-            selected = emptySet()
-            scanning = false
         }
     }
 
-    fun deleteOne(song: Song) {
+    /** Deletes the given song ids. On Android 10+ this shows one system confirmation for all. */
+    fun deleteIds(ids: Set<Long>) {
+        if (ids.isEmpty()) return
+        val uris = ids.map { ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, it) }
         scope.launch {
             withContext(Dispatchers.IO) {
                 try {
-                    context.contentResolver.delete(song.uri, null, null)
-                    withContext(Dispatchers.Main) {
-                        allSongs = allSongs.filterNot { it.id == song.id }
-                        groups = groups.map { g -> g.filterNot { it.id == song.id } }.filter { it.size > 1 }
-                    }
-                } catch (e: SecurityException) {
-                    // Android 10+ requires user confirmation via system dialog
-                    val intentSender = when {
-                        Build.VERSION.SDK_INT >= 30 -> {
-                            MediaStore.createDeleteRequest(context.contentResolver, listOf(song.uri)).intentSender
+                    if (Build.VERSION.SDK_INT >= 30) {
+                        val pi = MediaStore.createDeleteRequest(context.contentResolver, uris)
+                        withContext(Dispatchers.Main) {
+                            pendingDeleteIds = ids
+                            deleteRequestLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
                         }
-                        e is RecoverableActionException -> null
-                        else -> null
-                    }
-                    withContext(Dispatchers.Main) {
-                        pendingDeleteUri = song.uri
-                        if (intentSender != null) {
-                            deleteRequestLauncher.launch(IntentSenderRequest.Builder(intentSender).build())
+                    } else {
+                        // Older Android: try direct delete per file; may prompt on API 29.
+                        var deleted = false
+                        for (uri in uris) {
+                            try { context.contentResolver.delete(uri, null, null); deleted = true }
+                            catch (e: SecurityException) {
+                                if (Build.VERSION.SDK_INT >= 29 && e is RecoverableSecurityException) {
+                                    withContext(Dispatchers.Main) {
+                                        pendingDeleteIds = ids
+                                        deleteRequestLauncher.launch(
+                                            IntentSenderRequest.Builder(e.userAction.actionIntent.intentSender).build()
+                                        )
+                                    }
+                                    return@withContext
+                                }
+                            }
                         }
+                        if (deleted) withContext(Dispatchers.Main) { removeIds(ids) }
                     }
-                }
+                } catch (e: Exception) { /* ignore */ }
             }
         }
     }
 
-    Scaffold(topBar = {
-        TopAppBar(title = { Text("מציאת שירים כפולים") })
-    }) { padding ->
-        Column(
-            modifier = Modifier
-                .padding(padding)
-                .padding(16.dp)
-                .fillMaxSize()
-        ) {
-            if (!hasPermission) {
-                Text("כדי לסרוק את השירים במכשיר, צריך לאשר גישה לקבצי מדיה.")
+    fun playSong(song: Song) {
+        try {
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(song.uri, "audio/*")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            errorMsg = "לא נמצאה אפליקציית נגן במכשיר שיכולה לפתוח את הקובץ"
+        }
+    }
+
+    when (screen) {
+        Screen.Scan -> Scaffold(topBar = {
+            TopAppBar(
+                title = { Text("מציאת שירים כפולים") },
+                actions = {
+                    IconButton(onClick = { screen = Screen.About }) {
+                        Icon(Icons.Filled.Info, contentDescription = "אודות")
+                    }
+                }
+            )
+        }) { padding ->
+            Column(
+                modifier = Modifier
+                    .padding(padding)
+                    .padding(16.dp)
+                    .fillMaxSize()
+            ) {
+                if (!hasPermission) {
+                    Text("כדי לסרוק את השירים במכשיר, צריך לאשר גישה לקבצי מדיה.")
+                    Spacer(Modifier.height(12.dp))
+                    Button(onClick = { requestPermission() }) { Text("אישור הרשאה") }
+                    return@Column
+                }
+
+                Text("סף דמיון בשם: ${(simThreshold * 100).toInt()}%")
+                Slider(value = simThreshold, onValueChange = { simThreshold = it }, valueRange = 0.5f..1f, enabled = !scanning)
+
+                Text("טווח סטייה באורך: ${durTolerance.toInt()} שניות")
+                Slider(value = durTolerance, onValueChange = { durTolerance = it }, valueRange = 0f..15f, enabled = !scanning)
+
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Button(onClick = { runScan() }, enabled = !scanning) {
+                        Text(if (scanning) "סורק..." else "סרוק את המכשיר")
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    if (allSongs.isNotEmpty() && !scanning) {
+                        Text("${allSongs.size} שירים · ${groups.size} קבוצות", fontSize = 13.sp)
+                    }
+                }
+
+                if (scanning) {
+                    Spacer(Modifier.height(16.dp))
+                    Text(scanPhase, fontSize = 13.sp)
+                    Spacer(Modifier.height(6.dp))
+                    if (scanProgress < 0f) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    } else {
+                        LinearProgressIndicator(
+                            progress = { scanProgress },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text("${(scanProgress * 100).toInt()}%", fontSize = 12.sp)
+                    }
+                }
+
                 Spacer(Modifier.height(12.dp))
-                Button(onClick = { requestPermission() }) { Text("אישור הרשאה") }
-                return@Column
-            }
 
-            Text("סף דמיון בשם: ${(simThreshold * 100).toInt()}%")
-            Slider(value = simThreshold, onValueChange = { simThreshold = it }, valueRange = 0.5f..1f)
-
-            Text("טווח סטייה באורך: ${durTolerance.toInt()} שניות")
-            Slider(value = durTolerance, onValueChange = { durTolerance = it }, valueRange = 0f..15f)
-
-            Spacer(Modifier.height(8.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Button(onClick = { runScan() }, enabled = !scanning) {
-                    Text(if (scanning) "סורק..." else "סרוק את המכשיר")
+                errorMsg?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, fontSize = 13.sp,
+                        modifier = Modifier.padding(vertical = 6.dp))
                 }
-                Spacer(Modifier.width(12.dp))
-                if (allSongs.isNotEmpty()) {
-                    Text("${allSongs.size} שירים · ${groups.size} קבוצות כפולות", fontSize = 13.sp)
+
+                if (groups.isEmpty() && !scanning && allSongs.isNotEmpty() && errorMsg == null) {
+                    Text("לא נמצאו כפילויות בקריטריונים הנוכחיים 🎉")
+                }
+
+                if (groups.isNotEmpty() && !scanning) {
+                    Spacer(Modifier.height(12.dp))
+                    Button(onClick = { screen = Screen.Results }, modifier = Modifier.fillMaxWidth()) {
+                        Text("הצג תוצאות (${groups.size} קבוצות)")
+                    }
                 }
             }
+        }
 
-            Spacer(Modifier.height(12.dp))
+        Screen.Results -> Scaffold(topBar = {
+            TopAppBar(
+                title = { Text("תוצאות (${groups.size} קבוצות)") },
+                navigationIcon = {
+                    IconButton(onClick = { screen = Screen.Scan }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "חזרה")
+                    }
+                }
+            )
+        }) { padding ->
+            Column(
+                modifier = Modifier
+                    .padding(padding)
+                    .padding(horizontal = 16.dp)
+                    .fillMaxSize()
+            ) {
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(onClick = { selected = autoSelectDuplicates(groups) }) {
+                        Text("סמן כפולים אוטומטית")
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    if (selected.isNotEmpty()) {
+                        TextButton(onClick = { selected = emptySet() }) { Text("נקה") }
+                    }
+                }
+                Button(
+                    onClick = { deleteIds(selected) },
+                    enabled = selected.isNotEmpty(),
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 8.dp)
+                ) { Text("מחק מסומנים (${selected.size})") }
 
-            if (groups.isEmpty() && !scanning && allSongs.isNotEmpty()) {
-                Text("לא נמצאו כפילויות בקריטריונים הנוכחיים 🎉")
-            }
+                if (groups.isEmpty()) {
+                    Spacer(Modifier.height(24.dp))
+                    Text("כל הכפילויות טופלו 🎉")
+                }
 
-            LazyColumn(modifier = Modifier.weight(1f)) {
-                items(groups) { group ->
-                    Card(modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 6.dp)) {
-                        Column(Modifier.padding(12.dp)) {
-                            Text("קבוצה של ${group.size} שירים דומים", fontWeight = FontWeight.Bold)
-                            group.forEach { song ->
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Column(Modifier.weight(1f)) {
-                                        Text(song.title, fontSize = 14.sp)
-                                        Text(
-                                            "${formatDuration(song.durationSec)} · ${song.path}",
-                                            fontSize = 11.sp
+                LazyColumn(modifier = Modifier.weight(1f)) {
+                    items(groups) { group ->
+                        Card(modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 6.dp)) {
+                            Column(Modifier.padding(12.dp)) {
+                                Text("קבוצה של ${group.size} שירים דומים", fontWeight = FontWeight.Bold)
+                                val best = group.maxByOrNull { it.sizeBytes }
+                                group.forEach { song ->
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Checkbox(
+                                            checked = song.id in selected,
+                                            onCheckedChange = { checked ->
+                                                selected = if (checked) selected + song.id else selected - song.id
+                                            }
                                         )
+                                        Column(
+                                            Modifier
+                                                .weight(1f)
+                                                .clickable { playSong(song) }
+                                        ) {
+                                            Text(
+                                                song.title + if (song.id == best?.id) "  ⭐" else "",
+                                                fontSize = 14.sp,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                            Text(
+                                                "${formatDuration(song.durationSec)} · ${formatSize(song.sizeBytes)} · הקש לניגון ▶",
+                                                fontSize = 11.sp
+                                            )
+                                            Text(
+                                                song.path,
+                                                fontSize = 12.sp,
+                                                softWrap = true
+                                            )
+                                        }
+                                        TextButton(onClick = { deleteIds(setOf(song.id)) }) { Text("מחק") }
                                     }
-                                    TextButton(onClick = { deleteOne(song) }) { Text("מחק") }
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        Screen.About -> Scaffold(topBar = {
+            TopAppBar(
+                title = { Text("אודות") },
+                navigationIcon = {
+                    IconButton(onClick = { screen = Screen.Scan }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "חזרה")
+                    }
+                }
+            )
+        }) { padding ->
+            Column(
+                modifier = Modifier
+                    .padding(padding)
+                    .padding(24.dp)
+                    .fillMaxSize()
+            ) {
+                Text("מציאת שירים כפולים", fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "אפליקציה לזיהוי שירים כפולים במכשיר לפי דמיון בשם הקובץ ואורך השיר, " +
+                        "פועלת כולה במכשיר בלי חיבור לרשת.",
+                    fontSize = 14.sp
+                )
+                Spacer(Modifier.height(24.dp))
+                Text(
+                    "פותח על ידי יהודי לא פשוט @מתמחים טופ 🔥",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp
+                )
             }
         }
     }
