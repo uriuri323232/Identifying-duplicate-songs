@@ -13,20 +13,13 @@ import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Info
+import androidx.compose.runtime.saveable.rememberSaveable
+import com.example.duplicatesongs.ui.AboutScreen
+import com.example.duplicatesongs.ui.ResultsScreen
+import com.example.duplicatesongs.ui.ScanScreen
+import com.example.duplicatesongs.ui.theme.DuplicateSongFinderTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -246,8 +239,8 @@ fun AppRoot(lastCrash: String? = null) {
     var hasPermission by remember {
         mutableStateOf(hasAudioPermission(context))
     }
-    var simThreshold by remember { mutableStateOf(0.8f) }
-    var durTolerance by remember { mutableStateOf(3f) }
+    var simThreshold by rememberSaveable { mutableStateOf(0.8f) }
+    var durTolerance by rememberSaveable { mutableStateOf(3f) }
     var scanning by remember { mutableStateOf(false) }
     var scanPhase by remember { mutableStateOf("") }
     var scanProgress by remember { mutableStateOf(0f) } // 0f..1f, -1f = indeterminate
@@ -271,17 +264,27 @@ fun AppRoot(lastCrash: String? = null) {
         ActivityResultContracts.RequestPermission()
     ) { granted -> hasPermission = granted }
 
+    val snackbarHostState = remember { SnackbarHostState() }
+
     fun removeIds(ids: Set<Long>) {
         allSongs = allSongs.filterNot { it.id in ids }
         groups = groups.map { g -> g.filterNot { it.id in ids } }.filter { it.size > 1 }
         selected = selected - ids
     }
 
+    fun notifyDeleted(ids: Set<Long>) {
+        val freedBytes = allSongs.filter { it.id in ids }.sumOf { it.sizeBytes }
+        removeIds(ids)
+        scope.launch {
+            snackbarHostState.showSnackbar("נמחקו ${ids.size} שירים · שוחררו ${formatSize(freedBytes)}")
+        }
+    }
+
     // Handles the "confirm delete" system dialog required on Android 10+ (API 29+).
     val deleteRequestLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
-        if (result.resultCode == android.app.Activity.RESULT_OK) removeIds(pendingDeleteIds)
+        if (result.resultCode == android.app.Activity.RESULT_OK) notifyDeleted(pendingDeleteIds)
         pendingDeleteIds = emptySet()
     }
 
@@ -367,7 +370,7 @@ fun AppRoot(lastCrash: String? = null) {
                                 }
                             }
                         }
-                        if (deleted) withContext(Dispatchers.Main) { removeIds(ids) }
+                        if (deleted) withContext(Dispatchers.Main) { notifyDeleted(ids) }
                     }
                 } catch (e: Exception) { /* ignore */ }
             }
@@ -386,199 +389,39 @@ fun AppRoot(lastCrash: String? = null) {
         }
     }
 
-    when (screen) {
-        Screen.Scan -> Scaffold(topBar = {
-            TopAppBar(
-                title = { Text("מציאת שירים כפולים") },
-                actions = {
-                    IconButton(onClick = { screen = Screen.About }) {
-                        Icon(Icons.Filled.Info, contentDescription = "אודות")
-                    }
-                }
+    DuplicateSongFinderTheme {
+        when (screen) {
+            Screen.Scan -> ScanScreen(
+                hasPermission = hasPermission,
+                onRequestPermission = { requestPermission() },
+                simThreshold = simThreshold,
+                onSimThresholdChange = { simThreshold = it },
+                durTolerance = durTolerance,
+                onDurToleranceChange = { durTolerance = it },
+                scanning = scanning,
+                scanPhase = scanPhase,
+                scanProgress = scanProgress,
+                allSongs = allSongs,
+                groupsCount = groups.size,
+                errorMsg = errorMsg,
+                onScan = { runScan() },
+                onShowResults = { screen = Screen.Results },
+                onShowAbout = { screen = Screen.About }
             )
-        }) { padding ->
-            Column(
-                modifier = Modifier
-                    .padding(padding)
-                    .padding(16.dp)
-                    .fillMaxSize()
-            ) {
-                if (!hasPermission) {
-                    Text("כדי לסרוק את השירים במכשיר, צריך לאשר גישה לקבצי מדיה.")
-                    Spacer(Modifier.height(12.dp))
-                    Button(onClick = { requestPermission() }) { Text("אישור הרשאה") }
-                    return@Column
-                }
 
-                Text("סף דמיון בשם: ${(simThreshold * 100).toInt()}%")
-                Slider(value = simThreshold, onValueChange = { simThreshold = it }, valueRange = 0.5f..1f, enabled = !scanning)
-
-                Text("טווח סטייה באורך: ${durTolerance.toInt()} שניות")
-                Slider(value = durTolerance, onValueChange = { durTolerance = it }, valueRange = 0f..15f, enabled = !scanning)
-
-                Spacer(Modifier.height(8.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Button(onClick = { runScan() }, enabled = !scanning) {
-                        Text(if (scanning) "סורק..." else "סרוק את המכשיר")
-                    }
-                    Spacer(Modifier.width(12.dp))
-                    if (allSongs.isNotEmpty() && !scanning) {
-                        Text("${allSongs.size} שירים · ${groups.size} קבוצות", fontSize = 13.sp)
-                    }
-                }
-
-                if (scanning) {
-                    Spacer(Modifier.height(16.dp))
-                    Text(scanPhase, fontSize = 13.sp)
-                    Spacer(Modifier.height(6.dp))
-                    if (scanProgress < 0f) {
-                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                    } else {
-                        LinearProgressIndicator(
-                            progress = { scanProgress },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Text("${(scanProgress * 100).toInt()}%", fontSize = 12.sp)
-                    }
-                }
-
-                Spacer(Modifier.height(12.dp))
-
-                errorMsg?.let {
-                    Text(it, color = MaterialTheme.colorScheme.error, fontSize = 13.sp,
-                        modifier = Modifier.padding(vertical = 6.dp))
-                }
-
-                if (groups.isEmpty() && !scanning && allSongs.isNotEmpty() && errorMsg == null) {
-                    Text("לא נמצאו כפילויות בקריטריונים הנוכחיים 🎉")
-                }
-
-                if (groups.isNotEmpty() && !scanning) {
-                    Spacer(Modifier.height(12.dp))
-                    Button(onClick = { screen = Screen.Results }, modifier = Modifier.fillMaxWidth()) {
-                        Text("הצג תוצאות (${groups.size} קבוצות)")
-                    }
-                }
-            }
-        }
-
-        Screen.Results -> Scaffold(topBar = {
-            TopAppBar(
-                title = { Text("תוצאות (${groups.size} קבוצות)") },
-                navigationIcon = {
-                    IconButton(onClick = { screen = Screen.Scan }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "חזרה")
-                    }
-                }
+            Screen.Results -> ResultsScreen(
+                groups = groups,
+                selected = selected,
+                onSelectedChange = { selected = it },
+                onAutoSelect = { selected = autoSelectDuplicates(groups) },
+                onDelete = { deleteIds(it) },
+                onDeleteSingle = { deleteIds(setOf(it)) },
+                onPlay = { playSong(it) },
+                onBack = { screen = Screen.Scan },
+                snackbarHostState = snackbarHostState
             )
-        }) { padding ->
-            Column(
-                modifier = Modifier
-                    .padding(padding)
-                    .padding(horizontal = 16.dp)
-                    .fillMaxSize()
-            ) {
-                Spacer(Modifier.height(8.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedButton(onClick = { selected = autoSelectDuplicates(groups) }) {
-                        Text("סמן כפולים אוטומטית")
-                    }
-                    Spacer(Modifier.width(8.dp))
-                    if (selected.isNotEmpty()) {
-                        TextButton(onClick = { selected = emptySet() }) { Text("נקה") }
-                    }
-                }
-                Button(
-                    onClick = { deleteIds(selected) },
-                    enabled = selected.isNotEmpty(),
-                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 8.dp)
-                ) { Text("מחק מסומנים (${selected.size})") }
 
-                if (groups.isEmpty()) {
-                    Spacer(Modifier.height(24.dp))
-                    Text("כל הכפילויות טופלו 🎉")
-                }
-
-                LazyColumn(modifier = Modifier.weight(1f)) {
-                    items(groups) { group ->
-                        Card(modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 6.dp)) {
-                            Column(Modifier.padding(12.dp)) {
-                                Text("קבוצה של ${group.size} שירים דומים", fontWeight = FontWeight.Bold)
-                                val best = group.maxByOrNull { it.sizeBytes }
-                                group.forEach { song ->
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Checkbox(
-                                            checked = song.id in selected,
-                                            onCheckedChange = { checked ->
-                                                selected = if (checked) selected + song.id else selected - song.id
-                                            }
-                                        )
-                                        Column(
-                                            Modifier
-                                                .weight(1f)
-                                                .clickable { playSong(song) }
-                                        ) {
-                                            Text(
-                                                song.title + if (song.id == best?.id) "  ⭐" else "",
-                                                fontSize = 14.sp,
-                                                fontWeight = FontWeight.Medium
-                                            )
-                                            Text(
-                                                "${formatDuration(song.durationSec)} · ${formatSize(song.sizeBytes)} · הקש לניגון ▶",
-                                                fontSize = 11.sp
-                                            )
-                                            Text(
-                                                song.path,
-                                                fontSize = 12.sp,
-                                                softWrap = true
-                                            )
-                                        }
-                                        TextButton(onClick = { deleteIds(setOf(song.id)) }) { Text("מחק") }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Screen.About -> Scaffold(topBar = {
-            TopAppBar(
-                title = { Text("אודות") },
-                navigationIcon = {
-                    IconButton(onClick = { screen = Screen.Scan }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "חזרה")
-                    }
-                }
-            )
-        }) { padding ->
-            Column(
-                modifier = Modifier
-                    .padding(padding)
-                    .padding(24.dp)
-                    .fillMaxSize()
-            ) {
-                Text("מציאת שירים כפולים", fontWeight = FontWeight.Bold, fontSize = 20.sp)
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "אפליקציה לזיהוי שירים כפולים במכשיר לפי דמיון בשם הקובץ ואורך השיר, " +
-                        "פועלת כולה במכשיר בלי חיבור לרשת.",
-                    fontSize = 14.sp
-                )
-                Spacer(Modifier.height(24.dp))
-                Text(
-                    "פותח על ידי יהודי לא פשוט @מתמחים טופ 🔥",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 15.sp
-                )
-            }
+            Screen.About -> AboutScreen(onBack = { screen = Screen.Scan })
         }
     }
 }
