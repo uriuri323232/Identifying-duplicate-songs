@@ -1,7 +1,6 @@
-<resources xmlns:tools="http://schemas.android.com/tools">
+<resources>
     <style name="Theme.DuplicateSongFinder" parent="android:Theme.Material.Light.NoActionBar">
-        <item name="android:windowBackground">#FDFBFF</item>
-        <item name="android:statusBarColor">#FDFBFF</item>
-        <item name="android:navigationBarColor">#FDFBFF</item>
+        <item name="android:statusBarColor">#FF12594A</item>
+        <item name="android:windowBackground">#FFF3F8F6</item>
     </style>
 </resources>
