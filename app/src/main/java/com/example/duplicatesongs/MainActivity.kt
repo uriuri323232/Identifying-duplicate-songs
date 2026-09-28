@@ -3,6 +3,7 @@
 package com.example.duplicatesongs
 
 import android.app.RecoverableSecurityException
+import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
@@ -12,6 +13,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.IntentSenderRequest
@@ -23,7 +25,10 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -40,13 +45,19 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Badge
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -61,7 +72,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
@@ -69,11 +83,13 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TriStateCheckbox
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -90,6 +106,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -301,6 +318,71 @@ fun loadSongs(context: Context): List<Song> {
         }
     }
     return songs
+}
+
+// ---------- Trash (Android 11+ MediaStore trash) ----------
+
+/** A song that was moved to the system trash and can still be restored. */
+data class TrashedSong(
+    val id: Long,
+    val title: String,
+    val folder: String,
+    val durationSec: Long,
+    val sizeBytes: Long,
+    /** When the system will delete it automatically (epoch seconds), 0 if unknown. */
+    val expiresSec: Long
+) {
+    /** Days left before automatic deletion, or -1 if unknown. */
+    fun daysLeft(): Long =
+        if (expiresSec <= 0) -1L
+        else ((expiresSec * 1000 - System.currentTimeMillis()) / 86_400_000L).coerceAtLeast(0L)
+}
+
+private enum class TrashAction { Restore, DeleteForever }
+
+/** Audio files that are currently in the system trash. Empty below Android 11. */
+fun loadTrashedSongs(context: Context): List<TrashedSong> {
+    if (Build.VERSION.SDK_INT >= 30) {
+        val result = mutableListOf<TrashedSong>()
+        val projection = arrayOf(
+            MediaStore.Audio.Media._ID,
+            MediaStore.Audio.Media.DISPLAY_NAME,
+            MediaStore.Audio.Media.DATA,
+            MediaStore.Audio.Media.DURATION,
+            MediaStore.Audio.Media.SIZE,
+            MediaStore.MediaColumns.DATE_EXPIRES
+        )
+        val args = Bundle().apply {
+            putString(ContentResolver.QUERY_ARG_SQL_SELECTION, "${MediaStore.Audio.Media.IS_MUSIC} != 0")
+            putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_ONLY)
+        }
+        context.contentResolver.query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, projection, args, null)?.use { c ->
+            val idCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
+            val nameCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
+            val dataCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
+            val durCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
+            val sizeCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE)
+            val expCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_EXPIRES)
+            while (c.moveToNext()) {
+                val rawName = c.getString(nameCol) ?: continue
+                // Trashed files are renamed by the system to ".trashed-<timestamp>-<name>".
+                val name = rawName.replace(Regex("^\\.trashed-\\d+-"), "")
+                val path = c.getString(dataCol) ?: ""
+                result.add(
+                    TrashedSong(
+                        id = c.getLong(idCol),
+                        title = name,
+                        folder = path.substringBeforeLast('/', ""),
+                        durationSec = c.getLong(durCol) / 1000,
+                        sizeBytes = c.getLong(sizeCol),
+                        expiresSec = if (c.isNull(expCol)) 0L else c.getLong(expCol)
+                    )
+                )
+            }
+        }
+        return result.sortedByDescending { it.expiresSec }
+    }
+    return emptyList()
 }
 
 fun wastedBytes(group: List<Song>): Long =
@@ -542,6 +624,18 @@ fun AppLogo(logoSize: Dp = 56.dp) {
     }
 }
 
+/** Top-bar shortcut to the trash, with a small badge showing how many songs are in it. */
+@Composable
+private fun TrashIconButton(count: Int, onClick: () -> Unit) {
+    IconButton(onClick = onClick) {
+        BadgedBox(badge = {
+            if (count > 0) Badge { Text(if (count > 99) "99+" else "$count") }
+        }) {
+            Icon(Icons.Filled.Delete, contentDescription = "פח")
+        }
+    }
+}
+
 @Composable
 private fun Pill(text: String) {
     Surface(shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.primaryContainer) {
@@ -577,7 +671,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Screen { Scan, Results, Ignored, About }
+private enum class Screen { Scan, Results, Ignored, Trash, About }
 
 private data class Preset(val label: String, val sim: Float, val tol: Float)
 
@@ -617,10 +711,62 @@ fun AppRoot(lastCrash: String? = null) {
     var showCrash by remember { mutableStateOf(lastCrash != null) }
     var freedBytes by remember { mutableStateOf(prefs.freedBytes) }
     var freedCount by remember { mutableStateOf(prefs.freedCount) }
+    var trashed by remember { mutableStateOf<List<TrashedSong>>(emptyList()) }
+    var trashLoading by remember { mutableStateOf(false) }
+    var trashSelected by remember { mutableStateOf<Set<Long>>(emptySet()) }
+    var trashBackTo by remember { mutableStateOf(Screen.Scan) }
+    var pendingTrashIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
+    var pendingTrashAction by remember { mutableStateOf(TrashAction.Restore) }
 
+    val trashSupported = Build.VERSION.SDK_INT >= 30
     val trashActive = useTrash && Build.VERSION.SDK_INT >= 30
 
     fun toast(msg: String) { scope.launch { snackbar.showSnackbar(msg) } }
+
+    fun toastWithAction(msg: String, label: String, onAction: () -> Unit) {
+        scope.launch {
+            val r = snackbar.showSnackbar(msg, actionLabel = label, duration = SnackbarDuration.Long)
+            if (r == SnackbarResult.ActionPerformed) onAction()
+        }
+    }
+
+    /** Reloads the list of files currently in the system trash. */
+    fun refreshTrash() {
+        if (!trashSupported || !hasPermission) return
+        scope.launch {
+            trashLoading = true
+            val list = withContext(Dispatchers.IO) {
+                runCatching { loadTrashedSongs(context) }.getOrDefault(emptyList())
+            }
+            trashed = list
+            trashSelected = trashSelected intersect list.map { it.id }.toSet()
+            trashLoading = false
+        }
+    }
+
+    fun openTrash() {
+        if (screen != Screen.Trash) trashBackTo = screen
+        trashSelected = emptySet()
+        refreshTrash()
+        screen = Screen.Trash
+    }
+
+    /** After files come back from the trash, refresh the library so they show up again. */
+    fun reloadAfterRestore() {
+        if (allSongs.isEmpty()) return
+        scope.launch {
+            val songs = withContext(Dispatchers.IO) { loadSongs(context) }
+            val ignored = store.snapshot()
+            val sim = lastSim
+            val tol = lastTol
+            val result = withContext(Dispatchers.Default) { findDuplicateGroups(songs, sim, tol, ignored) }
+            allSongs = songs
+            groups = result
+            selected = emptySet()
+        }
+    }
+
+    LaunchedEffect(hasPermission) { refreshTrash() }
 
     if (showCrash && lastCrash != null) {
         AlertDialog(
@@ -660,9 +806,58 @@ fun AppRoot(lastCrash: String? = null) {
             val count = pendingDeleteIds.size
             recordFreed(pendingDeleteIds)
             removeIds(pendingDeleteIds)
-            toast(if (trashActive) "$count קבצים הועברו לפח" else "$count קבצים נמחקו")
+            if (trashActive) {
+                toastWithAction("$count קבצים הועברו לפח", "פתח פח") { openTrash() }
+                refreshTrash()
+            } else {
+                toast("$count קבצים נמחקו")
+            }
         }
         pendingDeleteIds = emptySet()
+    }
+
+    // Restore from trash / delete forever: the system asks the user to confirm.
+    val trashRequestLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            val ids = pendingTrashIds
+            val n = ids.size
+            if (pendingTrashAction == TrashAction.Restore) {
+                // These files were counted as "cleaned" when they went to the trash; take them back.
+                val bytes = trashed.filter { it.id in ids }.sumOf { it.sizeBytes }
+                prefs.freedBytes = (prefs.freedBytes - bytes).coerceAtLeast(0L)
+                prefs.freedCount = (prefs.freedCount - n).coerceAtLeast(0)
+                freedBytes = prefs.freedBytes
+                freedCount = prefs.freedCount
+                toast("$n קבצים שוחזרו לספרייה")
+                reloadAfterRestore()
+            } else {
+                toast("$n קבצים נמחקו לצמיתות")
+            }
+            trashed = trashed.filterNot { it.id in ids }
+            trashSelected = trashSelected - ids
+            refreshTrash()
+        }
+        pendingTrashIds = emptySet()
+    }
+
+    fun trashRequest(ids: Set<Long>, action: TrashAction) {
+        if (ids.isEmpty()) return
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                val uris = ids.map { ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, it) }
+                val pi = if (action == TrashAction.Restore)
+                    MediaStore.createTrashRequest(context.contentResolver, uris, false)
+                else
+                    MediaStore.createDeleteRequest(context.contentResolver, uris)
+                pendingTrashIds = ids
+                pendingTrashAction = action
+                trashRequestLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
+            } catch (e: Exception) {
+                toast("הפעולה נכשלה: ${e.message ?: e.javaClass.simpleName}")
+            }
+        }
     }
 
     fun requestPermission() {
@@ -846,39 +1041,65 @@ fun AppRoot(lastCrash: String? = null) {
     }
 
     markGroup?.let { g ->
+        val checkedCount = g.count { it.id in markSelected }
+        val allChecked = checkedCount == g.size
+        val toggleAll = {
+            markSelected = if (allChecked) emptySet() else g.map { it.id }.toSet()
+        }
         AlertDialog(
             onDismissRequest = { markGroup = null },
             title = { Text("אלה לא באמת אותו שיר?") },
             text = {
-                Column(Modifier.verticalScroll(rememberScrollState())) {
+                Column {
                     Text(
                         "סמן את השירים שאינם כפולים זה של זה. האפליקציה תזכור את זה " +
                             "ולא תציג אותם שוב ככפולים בסריקות הבאות.",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(Modifier.height(8.dp))
-                    g.forEach { s ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    markSelected = if (s.id in markSelected) markSelected - s.id else markSelected + s.id
-                                },
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Checkbox(
-                                checked = s.id in markSelected,
-                                onCheckedChange = { c ->
-                                    markSelected = if (c) markSelected + s.id else markSelected - s.id
-                                }
-                            )
-                            Column(Modifier.weight(1f)) {
-                                Text(s.title, style = MaterialTheme.typography.bodyMedium)
-                                Text(
-                                    "${formatDuration(s.durationSec)} · ${formatSize(s.sizeBytes)}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    Row(
+                        modifier = Modifier.fillMaxWidth().clickable { toggleAll() },
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TriStateCheckbox(
+                            state = when {
+                                allChecked -> ToggleableState.On
+                                checkedCount == 0 -> ToggleableState.Off
+                                else -> ToggleableState.Indeterminate
+                            },
+                            onClick = { toggleAll() }
+                        )
+                        Text(
+                            if (allChecked) "בטל סימון של כולם" else "סמן את כולם (${g.size})",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    HorizontalDivider()
+                    Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+                        g.forEach { s ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        markSelected = if (s.id in markSelected) markSelected - s.id else markSelected + s.id
+                                    },
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = s.id in markSelected,
+                                    onCheckedChange = { c ->
+                                        markSelected = if (c) markSelected + s.id else markSelected - s.id
+                                    }
                                 )
+                                Column(Modifier.weight(1f)) {
+                                    Text(s.title, style = MaterialTheme.typography.bodyMedium)
+                                    Text(
+                                        "${formatDuration(s.durationSec)} · ${formatSize(s.sizeBytes)}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
                             }
                         }
                     }
@@ -886,7 +1107,7 @@ fun AppRoot(lastCrash: String? = null) {
             },
             confirmButton = {
                 TextButton(
-                    enabled = markSelected.size >= 2,
+                    enabled = checkedCount >= 2,
                     onClick = {
                         store.addAll(g.filter { it.id in markSelected }.map { it.fingerprint })
                         ignoredPairs = store.asList()
@@ -894,7 +1115,7 @@ fun AppRoot(lastCrash: String? = null) {
                         recompute()
                         toast("נשמר — השירים האלה לא יזוהו שוב ככפולים")
                     }
-                ) { Text("שמור") }
+                ) { Text(if (checkedCount >= 2) "שמור ($checkedCount)" else "שמור") }
             },
             dismissButton = { TextButton(onClick = { markGroup = null }) { Text("ביטול") } }
         )
@@ -902,6 +1123,47 @@ fun AppRoot(lastCrash: String? = null) {
 
     // ----- Screens -----
 
+    // System back returns to the main screen instead of closing the app.
+    BackHandler(enabled = screen != Screen.Scan) {
+        screen = if (screen == Screen.Trash) trashBackTo else Screen.Scan
+    }
+
+    val showNavBar = screen != Screen.About
+    Scaffold(
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
+        bottomBar = {
+            if (showNavBar) {
+                NavigationBar {
+                    NavigationBarItem(
+                        selected = screen == Screen.Scan || screen == Screen.Ignored,
+                        onClick = { screen = Screen.Scan },
+                        icon = { Icon(Icons.Filled.Search, contentDescription = null) },
+                        label = { Text("סריקה") }
+                    )
+                    NavigationBarItem(
+                        selected = screen == Screen.Results,
+                        enabled = allSongs.isNotEmpty(),
+                        onClick = { screen = Screen.Results },
+                        icon = { Icon(Icons.Filled.ContentCopy, contentDescription = null) },
+                        label = { Text("תוצאות") }
+                    )
+                    if (trashSupported && hasPermission) {
+                        NavigationBarItem(
+                            selected = screen == Screen.Trash,
+                            onClick = { if (screen != Screen.Trash) openTrash() },
+                            icon = {
+                                BadgedBox(badge = {
+                                    if (trashed.isNotEmpty()) Badge { Text(if (trashed.size > 99) "99+" else "${trashed.size}") }
+                                }) { Icon(Icons.Filled.Delete, contentDescription = null) }
+                            },
+                            label = { Text("פח") }
+                        )
+                    }
+                }
+            }
+        }
+    ) { navPadding ->
+    Box(Modifier.padding(navPadding).consumeWindowInsets(navPadding)) {
     when (screen) {
         Screen.Scan -> ScanScreen(
             snackbar = snackbar,
@@ -925,6 +1187,9 @@ fun AppRoot(lastCrash: String? = null) {
             wasted = groups.sumOf { wastedBytes(it) },
             errorMsg = errorMsg,
             ignoredCount = ignoredPairs.size,
+            trashSupported = trashSupported,
+            trashCount = trashed.size,
+            onOpenTrash = { openTrash() },
             onShowResults = { screen = Screen.Results },
             onShowIgnored = { screen = Screen.Ignored },
             onAbout = { screen = Screen.About }
@@ -935,6 +1200,9 @@ fun AppRoot(lastCrash: String? = null) {
             groups = groups,
             selected = selected,
             trashActive = trashActive,
+            trashSupported = trashSupported,
+            trashCount = trashed.size,
+            onOpenTrash = { openTrash() },
             onToggle = { id, checked -> selected = if (checked) selected + id else selected - id },
             onAutoSelect = { selected = autoSelectDuplicates(groups) },
             onClear = { selected = emptySet() },
@@ -957,6 +1225,11 @@ fun AppRoot(lastCrash: String? = null) {
                 ignoredPairs = store.asList()
                 recompute()
             },
+            onRemoveMany = { set ->
+                set.forEach { store.remove(it) }
+                ignoredPairs = store.asList()
+                recompute()
+            },
             onClearAll = {
                 store.clear()
                 ignoredPairs = store.asList()
@@ -965,7 +1238,21 @@ fun AppRoot(lastCrash: String? = null) {
             onBack = { screen = Screen.Scan }
         )
 
+        Screen.Trash -> TrashScreen(
+            snackbar = snackbar,
+            songs = trashed,
+            loading = trashLoading,
+            selected = trashSelected,
+            onToggle = { id, checked -> trashSelected = if (checked) trashSelected + id else trashSelected - id },
+            onSetSelected = { trashSelected = it },
+            onRestore = { trashRequest(it, TrashAction.Restore) },
+            onDeleteForever = { trashRequest(it, TrashAction.DeleteForever) },
+            onBack = { screen = trashBackTo }
+        )
+
         Screen.About -> AboutScreen(onBack = { screen = Screen.Scan })
+    }
+    }
     }
 }
 
@@ -992,6 +1279,9 @@ private fun ScanScreen(
     wasted: Long,
     errorMsg: String?,
     ignoredCount: Int,
+    trashSupported: Boolean,
+    trashCount: Int,
+    onOpenTrash: () -> Unit,
     onShowResults: () -> Unit,
     onShowIgnored: () -> Unit,
     onAbout: () -> Unit,
@@ -1002,6 +1292,7 @@ private fun ScanScreen(
         snackbarHost = { SnackbarHost(snackbar) },
         topBar = {
             AppBar(title = "מציאת שירים כפולים", actions = {
+                if (trashSupported && hasPermission) TrashIconButton(trashCount, onOpenTrash)
                 IconButton(onClick = onAbout) { Icon(Icons.Filled.Info, contentDescription = "אודות") }
             })
         }
@@ -1153,6 +1444,14 @@ private fun ScanScreen(
                 }
             }
 
+            if (trashSupported) {
+                OutlinedButton(onClick = onOpenTrash, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Filled.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(if (trashCount > 0) "הפח של השירים ($trashCount)" else "הפח של השירים")
+                }
+            }
+
             if (ignoredCount > 0) {
                 OutlinedButton(onClick = onShowIgnored, modifier = Modifier.fillMaxWidth()) {
                     Text("שירים שסימנת כ\"לא כפולים\" ($ignoredCount)")
@@ -1176,6 +1475,9 @@ private fun ResultsScreen(
     groups: List<List<Song>>,
     selected: Set<Long>,
     trashActive: Boolean,
+    trashSupported: Boolean,
+    trashCount: Int,
+    onOpenTrash: () -> Unit,
     onToggle: (Long, Boolean) -> Unit,
     onAutoSelect: () -> Unit,
     onClear: () -> Unit,
@@ -1201,6 +1503,9 @@ private fun ResultsScreen(
             SortMode.BY_NAME -> filtered.sortedBy { it.firstOrNull()?.title?.lowercase() ?: "" }
         }
     }
+
+    val shownIds = remember(shown) { shown.flatten().map { it.id }.toSet() }
+    val allShownSelected = shownIds.isNotEmpty() && selected.containsAll(shownIds)
 
     val folderCounts = remember(groups) {
         groups.flatten()
@@ -1257,208 +1562,435 @@ private fun ResultsScreen(
         snackbarHost = { SnackbarHost(snackbar) },
         topBar = {
             AppBar(title = "תוצאות", onBack = onBack, actions = {
+                if (trashSupported) TrashIconButton(trashCount, onOpenTrash)
                 IconButton(onClick = onExport) {
                     Icon(Icons.Filled.Share, contentDescription = "ייצוא הרשימה")
                 }
             })
         },
         bottomBar = {
-            Surface(shadowElevation = 8.dp, color = MaterialTheme.colorScheme.surface) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            if (selected.isEmpty()) "לא נבחרו קבצים" else "נבחרו ${selected.size} קבצים",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        if (selected.isNotEmpty()) {
+            // The bottom bar only appears once something is selected, so the list gets the whole screen.
+            if (selected.isNotEmpty()) {
+                Surface(shadowElevation = 8.dp, color = MaterialTheme.colorScheme.surface) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "נבחרו ${selected.size} קבצים",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold
+                            )
                             Text(
                                 "יפונו ${formatSize(selectedBytes)}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                    }
-                    Button(
-                        onClick = { onDelete(selected) },
-                        enabled = selected.isNotEmpty(),
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                    ) {
-                        Icon(Icons.Filled.Delete, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text(if (trashActive) "העבר לפח" else "מחק")
+                        Button(
+                            onClick = { onDelete(selected) },
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                        ) {
+                            Icon(Icons.Filled.Delete, contentDescription = null)
+                            Spacer(Modifier.width(6.dp))
+                            Text(if (trashActive) "העבר לפח" else "מחק")
+                        }
                     }
                 }
             }
         }
     ) { padding ->
-        Column(
+        // Everything (summary, search, sort, actions) lives INSIDE the list and scrolls away,
+        // so the song groups can use the full height of the screen.
+        LazyColumn(
             modifier = Modifier
                 .padding(padding)
                 .fillMaxSize()
-                .padding(horizontal = 16.dp)
+                .padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            contentPadding = PaddingValues(top = 10.dp, bottom = 16.dp)
         ) {
-            Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Pill("${groups.size} קבוצות")
-                if (totalWasted > 0) Pill("~${formatSize(totalWasted)} לפינוי")
+            item(key = "summary") {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Pill("${groups.size} קבוצות")
+                    if (totalWasted > 0) Pill("~${formatSize(totalWasted)} לפינוי")
+                }
             }
-            Spacer(Modifier.height(8.dp))
 
-            if (groups.isNotEmpty()) {
-                OutlinedTextField(
-                    value = query,
-                    onValueChange = { query = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    placeholder = { Text("חיפוש לפי שם או תיקייה...") },
-                    leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-                    trailingIcon = {
-                        if (query.isNotEmpty()) {
-                            IconButton(onClick = { query = "" }) {
-                                Icon(Icons.Filled.Close, contentDescription = "נקה חיפוש")
-                            }
+            if (trashSupported && trashCount > 0) {
+                item(key = "trashBanner") {
+                    Card(
+                        modifier = Modifier.fillMaxWidth().clickable { onOpenTrash() },
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                    ) {
+                        Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.Delete, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "בפח יש $trashCount שירים — הקש לשחזור או לריקון",
+                                modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
                         }
-                    },
-                    singleLine = true,
-                    shape = RoundedCornerShape(14.dp)
-                )
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState())
-                        .padding(vertical = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    SortMode.values().forEach { mode ->
-                        FilterChip(
-                            selected = sortMode == mode,
-                            onClick = { sortMode = mode },
-                            label = { Text(mode.label) }
-                        )
                     }
                 }
             }
 
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedButton(onClick = onAutoSelect) { Text("סמן כפולים אוטומטית") }
-                OutlinedButton(onClick = { showFolders = true }, enabled = groups.isNotEmpty()) {
-                    Icon(Icons.Filled.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("לפי תיקייה")
+            if (groups.isNotEmpty()) {
+                item(key = "search") {
+                    OutlinedTextField(
+                        value = query,
+                        onValueChange = { query = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text("חיפוש לפי שם או תיקייה...") },
+                        leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+                        trailingIcon = {
+                            if (query.isNotEmpty()) {
+                                IconButton(onClick = { query = "" }) {
+                                    Icon(Icons.Filled.Close, contentDescription = "נקה חיפוש")
+                                }
+                            }
+                        },
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp)
+                    )
                 }
-                if (selected.isNotEmpty()) TextButton(onClick = onClear) { Text("נקה בחירה") }
+                item(key = "sort") {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        SortMode.values().forEach { mode ->
+                            FilterChip(
+                                selected = sortMode == mode,
+                                onClick = { sortMode = mode },
+                                label = { Text(mode.label) }
+                            )
+                        }
+                    }
+                }
             }
-            Text(
-                "⭐ = הקובץ הגדול ביותר (בדרך כלל האיכות הטובה ביותר). הקש על שיר כדי לנגן ולוודא.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(vertical = 6.dp)
-            )
+
+            item(key = "actions") {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
+                        onClick = { onSetSelected(if (allShownSelected) selected - shownIds else selected + shownIds) },
+                        enabled = shownIds.isNotEmpty()
+                    ) { Text(if (allShownSelected) "בטל סימון הכול" else "סמן הכול (${shownIds.size})") }
+                    OutlinedButton(onClick = onAutoSelect) { Text("סמן כפולים אוטומטית") }
+                    OutlinedButton(onClick = { showFolders = true }, enabled = groups.isNotEmpty()) {
+                        Icon(Icons.Filled.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("לפי תיקייה")
+                    }
+                    if (selected.isNotEmpty()) TextButton(onClick = onClear) { Text("נקה בחירה") }
+                }
+            }
+
+            item(key = "hint") {
+                Text(
+                    "⭐ = הקובץ הגדול ביותר (בדרך כלל האיכות הטובה ביותר). הקש על שיר כדי לנגן ולוודא.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
 
             if (groups.isEmpty()) {
-                Spacer(Modifier.height(24.dp))
-                Text("כל הכפילויות טופלו 🎉", style = MaterialTheme.typography.titleMedium)
+                item(key = "empty") {
+                    Text(
+                        "כל הכפילויות טופלו 🎉",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(vertical = 24.dp)
+                    )
+                }
             } else if (shown.isEmpty()) {
-                Spacer(Modifier.height(24.dp))
-                Text("אין תוצאות עבור \"$query\"", style = MaterialTheme.typography.titleMedium)
+                item(key = "nomatch") {
+                    Text(
+                        "אין תוצאות עבור \"$query\"",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(vertical = 24.dp)
+                    )
+                }
             }
 
-            LazyColumn(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                itemsIndexed(shown) { index, group ->
-                    val best = group.maxByOrNull { it.sizeBytes }
-                    val sizeCounts = group.groupingBy { it.sizeBytes }.eachCount()
+            itemsIndexed(shown) { index, group ->
+                val best = group.maxByOrNull { it.sizeBytes }
+                val sizeCounts = group.groupingBy { it.sizeBytes }.eachCount()
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "קבוצה ${index + 1} · ${group.size} קבצים",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Pill("~${formatSize(wastedBytes(group))}")
+                        }
+                        val groupIds = group.map { it.id }.toSet()
+                        val groupAllSelected = selected.containsAll(groupIds)
+                        Row(
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            TextButton(onClick = {
+                                onSetSelected(if (groupAllSelected) selected - groupIds else selected + groupIds)
+                            }) { Text(if (groupAllSelected) "בטל סימון קבוצה" else "סמן קבוצה") }
+                            TextButton(onClick = {
+                                val others = group.filter { it.id != best?.id }.map { it.id }
+                                onSetSelected(selected + others)
+                            }) { Text("השאר רק את הטוב ביותר") }
+                            TextButton(onClick = { onMark(group) }) { Text("לא כפולים") }
+                        }
+                        group.forEach { song ->
+                            val details = buildString {
+                                append(formatDuration(song.durationSec))
+                                append(" · ")
+                                append(formatSize(song.sizeBytes))
+                                if (song.bitrateKbps > 0) append(" · ~${song.bitrateKbps} kbps")
+                                if ((sizeCounts[song.sizeBytes] ?: 0) > 1) append(" · גודל זהה")
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = song.id in selected,
+                                    onCheckedChange = { checked -> onToggle(song.id, checked) }
+                                )
+                                Column(
+                                    Modifier
+                                        .weight(1f)
+                                        .clickable { onPlay(song) }
+                                        .padding(vertical = 6.dp)
+                                ) {
+                                    Text(
+                                        song.title + if (song.id == best?.id) "  ⭐" else "",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Text(
+                                        details,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Text(
+                                        song.path,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        overflow = TextOverflow.Visible,
+                                        softWrap = true
+                                    )
+                                }
+                                IconButton(onClick = { onPlay(song) }) {
+                                    Icon(
+                                        Icons.Filled.PlayArrow,
+                                        contentDescription = "נגן",
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                IconButton(onClick = { onDelete(setOf(song.id)) }) {
+                                    Icon(
+                                        Icons.Filled.Delete,
+                                        contentDescription = "מחק",
+                                        tint = MaterialTheme.colorScheme.error
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------- Trash screen ----------
+
+@Composable
+private fun TrashScreen(
+    snackbar: SnackbarHostState,
+    songs: List<TrashedSong>,
+    loading: Boolean,
+    selected: Set<Long>,
+    onToggle: (Long, Boolean) -> Unit,
+    onSetSelected: (Set<Long>) -> Unit,
+    onRestore: (Set<Long>) -> Unit,
+    onDeleteForever: (Set<Long>) -> Unit,
+    onBack: () -> Unit
+) {
+    var confirmForever by remember { mutableStateOf(false) }
+    val selectedBytes = songs.filter { it.id in selected }.sumOf { it.sizeBytes }
+    val allChecked = songs.isNotEmpty() && songs.all { it.id in selected }
+
+    if (confirmForever) {
+        AlertDialog(
+            onDismissRequest = { confirmForever = false },
+            title = { Text("למחוק לצמיתות?") },
+            text = {
+                Text("${selected.size} קבצים (${formatSize(selectedBytes)}) יימחקו ולא ניתן יהיה לשחזר אותם.")
+            },
+            confirmButton = {
+                TextButton(onClick = { confirmForever = false; onDeleteForever(selected) }) {
+                    Text("מחק לצמיתות", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmForever = false }) { Text("ביטול") } }
+        )
+    }
+
+    Scaffold(
+        snackbarHost = { SnackbarHost(snackbar) },
+        topBar = { AppBar(title = "הפח", onBack = onBack) },
+        bottomBar = {
+            if (selected.isNotEmpty()) {
+                Surface(shadowElevation = 8.dp, color = MaterialTheme.colorScheme.surface) {
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)) {
+                        Text(
+                            "נבחרו ${selected.size} קבצים · ${formatSize(selectedBytes)}",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { onRestore(selected) }, modifier = Modifier.weight(1f)) {
+                                Icon(Icons.Filled.Restore, contentDescription = null)
+                                Spacer(Modifier.width(6.dp))
+                                Text("שחזר")
+                            }
+                            Button(
+                                onClick = { confirmForever = true },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                            ) {
+                                Icon(Icons.Filled.Delete, contentDescription = null)
+                                Spacer(Modifier.width(6.dp))
+                                Text("מחק לצמיתות")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            contentPadding = PaddingValues(top = 10.dp, bottom = 16.dp)
+        ) {
+            item(key = "info") {
+                Text(
+                    "שירים שהועברו לפח. הם נמחקים אוטומטית אחרי כ-30 יום, ועד אז אפשר לשחזר אותם.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            if (songs.isEmpty()) {
+                item(key = "empty") {
+                    Text(
+                        if (loading) "טוען..." else "הפח ריק",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(vertical = 24.dp)
+                    )
+                }
+            } else {
+                item(key = "bulkActions") {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        Button(
+                            onClick = { onRestore(songs.map { it.id }.toSet()) },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("שחזר הכול (${songs.size})") }
+                        OutlinedButton(
+                            onClick = { onSetSelected(songs.map { it.id }.toSet()); confirmForever = true },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                        ) { Text("רוקן את הפח") }
+                    }
+                }
+                item(key = "selectAll") {
+                    val toggleAll = {
+                        onSetSelected(if (allChecked) emptySet() else songs.map { it.id }.toSet())
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().clickable { toggleAll() },
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TriStateCheckbox(
+                            state = when {
+                                allChecked -> ToggleableState.On
+                                selected.isEmpty() -> ToggleableState.Off
+                                else -> ToggleableState.Indeterminate
+                            },
+                            onClick = { toggleAll() }
+                        )
+                        Text(
+                            if (allChecked) "בטל סימון של כולם" else "סמן הכול (${songs.size})",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+                itemsIndexed(songs, key = { _, song -> song.id }) { _, song ->
+                    val days = song.daysLeft()
+                    val details = buildString {
+                        append(formatDuration(song.durationSec))
+                        append(" · ")
+                        append(formatSize(song.sizeBytes))
+                        if (days >= 0) append(" · יימחק בעוד $days ימים")
+                    }
                     Card(
                         modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
+                        shape = RoundedCornerShape(14.dp),
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
                     ) {
-                        Column(Modifier.padding(12.dp)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onToggle(song.id, song.id !in selected) }
+                                .padding(vertical = 4.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = song.id in selected,
+                                onCheckedChange = { c -> onToggle(song.id, c) }
+                            )
+                            Column(Modifier.weight(1f)) {
+                                Text(song.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
                                 Text(
-                                    "קבוצה ${index + 1} · ${group.size} קבצים",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.weight(1f)
+                                    details,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
-                                Pill("~${formatSize(wastedBytes(group))}")
-                            }
-                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                TextButton(onClick = {
-                                    val others = group.filter { it.id != best?.id }.map { it.id }
-                                    onSetSelected(selected + others)
-                                }) { Text("השאר רק את הטוב ביותר") }
-                                TextButton(onClick = { onMark(group) }) { Text("לא כפולים") }
-                            }
-                            group.forEach { song ->
-                                val details = buildString {
-                                    append(formatDuration(song.durationSec))
-                                    append(" · ")
-                                    append(formatSize(song.sizeBytes))
-                                    if (song.bitrateKbps > 0) append(" · ~${song.bitrateKbps} kbps")
-                                    if ((sizeCounts[song.sizeBytes] ?: 0) > 1) append(" · גודל זהה")
-                                }
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Checkbox(
-                                        checked = song.id in selected,
-                                        onCheckedChange = { checked -> onToggle(song.id, checked) }
+                                if (song.folder.isNotEmpty()) {
+                                    Text(
+                                        song.folder,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
-                                    Column(
-                                        Modifier
-                                            .weight(1f)
-                                            .clickable { onPlay(song) }
-                                            .padding(vertical = 6.dp)
-                                    ) {
-                                        Text(
-                                            song.title + if (song.id == best?.id) "  ⭐" else "",
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            fontWeight = FontWeight.Medium
-                                        )
-                                        Text(
-                                            details,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                        Text(
-                                            song.path,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            overflow = TextOverflow.Visible,
-                                            softWrap = true
-                                        )
-                                    }
-                                    IconButton(onClick = { onPlay(song) }) {
-                                        Icon(
-                                            Icons.Filled.PlayArrow,
-                                            contentDescription = "נגן",
-                                            tint = MaterialTheme.colorScheme.primary
-                                        )
-                                    }
-                                    IconButton(onClick = { onDelete(setOf(song.id)) }) {
-                                        Icon(
-                                            Icons.Filled.Delete,
-                                            contentDescription = "מחק",
-                                            tint = MaterialTheme.colorScheme.error
-                                        )
-                                    }
                                 }
                             }
                         }
@@ -1476,9 +2008,13 @@ private fun IgnoredScreen(
     snackbar: SnackbarHostState,
     pairs: List<Pair<String, String>>,
     onRemove: (Pair<String, String>) -> Unit,
+    onRemoveMany: (Set<Pair<String, String>>) -> Unit,
     onClearAll: () -> Unit,
     onBack: () -> Unit
 ) {
+    var checked by remember { mutableStateOf<Set<Pair<String, String>>>(emptySet()) }
+    val sel = remember(checked, pairs) { checked.filter { it in pairs }.toSet() }
+    val allSel = pairs.isNotEmpty() && sel.size == pairs.size
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
         topBar = { AppBar(title = "סימונים של \"לא כפולים\"", onBack = onBack) }
@@ -1498,7 +2034,33 @@ private fun IgnoredScreen(
             if (pairs.isEmpty()) {
                 Text("אין סימונים.", style = MaterialTheme.typography.titleMedium)
             } else {
-                OutlinedButton(onClick = onClearAll) { Text("בטל את כל הסימונים") }
+                val toggleAll = { checked = if (allSel) emptySet() else pairs.toSet() }
+                Row(
+                    modifier = Modifier.fillMaxWidth().clickable { toggleAll() },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TriStateCheckbox(
+                        state = when {
+                            allSel -> ToggleableState.On
+                            sel.isEmpty() -> ToggleableState.Off
+                            else -> ToggleableState.Indeterminate
+                        },
+                        onClick = { toggleAll() }
+                    )
+                    Text(
+                        if (allSel) "בטל סימון של כולם" else "סמן הכול (${pairs.size})",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (sel.isNotEmpty()) {
+                        Button(onClick = { onRemoveMany(sel); checked = emptySet() }) {
+                            Text("בטל סימון ל-${sel.size} מסומנים")
+                        }
+                    }
+                    OutlinedButton(onClick = onClearAll) { Text("בטל את כל הסימונים") }
+                }
                 Spacer(Modifier.height(8.dp))
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     itemsIndexed(pairs) { _, p ->
@@ -1509,6 +2071,10 @@ private fun IgnoredScreen(
                             elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
                         ) {
                             Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Checkbox(
+                                    checked = p in sel,
+                                    onCheckedChange = { c -> checked = if (c) sel + p else sel - p }
+                                )
                                 Column(Modifier.weight(1f)) {
                                     Text(fingerprintName(p.first), style = MaterialTheme.typography.bodyMedium)
                                     Text("≠", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
