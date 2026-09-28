@@ -429,7 +429,7 @@ private fun SongRow(
                 // Full path shown without truncation, so the exact location of the
                 // file on the device is always visible - it wraps instead of ellipsizing.
                 Text(
-                    song.directory,
+   song.path,
                     fontSize = 10.sp,
                     lineHeight = 13.sp,
                     fontFamily = FontFamily.Monospace,
