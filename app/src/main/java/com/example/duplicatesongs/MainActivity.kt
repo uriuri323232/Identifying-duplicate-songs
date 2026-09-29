@@ -342,6 +342,86 @@ data class TrashedSong(
 
 private enum class TrashAction { Restore, DeleteForever }
 
+/**
+ * The app's own record of songs it moved to the system trash.
+ *
+ * Android only lets an app list trashed media that it owns, so files created by other apps
+ * (most music) never show up in a MediaStore trash query even though they ARE in the system
+ * trash. This log makes sure the in-app trash always shows what the app trashed.
+ * The system keeps trashed files for about 30 days, and so does this log.
+ */
+class TrashLog(context: Context) {
+    private val prefs = context.applicationContext
+        .getSharedPreferences("trash_log", Context.MODE_PRIVATE)
+
+    private fun readAll(): MutableList<TrashedSong> {
+        val out = mutableListOf<TrashedSong>()
+        try {
+            val arr = JSONArray(prefs.getString("items", "[]") ?: "[]")
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                out.add(
+                    TrashedSong(
+                        id = o.getLong("id"),
+                        title = o.getString("title"),
+                        folder = o.optString("folder", ""),
+                        durationSec = o.optLong("dur", 0L),
+                        sizeBytes = o.optLong("size", 0L),
+                        expiresSec = o.optLong("exp", 0L)
+                    )
+                )
+            }
+        } catch (_: Exception) {
+            // Corrupt data: start fresh rather than crash.
+        }
+        return out
+    }
+
+    private fun writeAll(items: List<TrashedSong>) {
+        val arr = JSONArray()
+        for (t in items) {
+            arr.put(
+                JSONObject()
+                    .put("id", t.id).put("title", t.title).put("folder", t.folder)
+                    .put("dur", t.durationSec).put("size", t.sizeBytes).put("exp", t.expiresSec)
+            )
+        }
+        prefs.edit().putString("items", arr.toString()).apply()
+    }
+
+    /** Entries that have not expired yet (expired ones are dropped). */
+    fun load(): List<TrashedSong> {
+        val now = System.currentTimeMillis() / 1000
+        val all = readAll()
+        val alive = all.filter { it.expiresSec > now }
+        if (alive.size != all.size) writeAll(alive)
+        return alive
+    }
+
+    fun add(songs: List<Song>) {
+        if (songs.isEmpty()) return
+        val exp = System.currentTimeMillis() / 1000 + 30L * 24 * 3600
+        val byId = LinkedHashMap<Long, TrashedSong>()
+        for (t in readAll()) byId[t.id] = t
+        for (song in songs) {
+            byId[song.id] = TrashedSong(
+                id = song.id,
+                title = song.title,
+                folder = song.path.substringBeforeLast('/', ""),
+                durationSec = song.durationSec,
+                sizeBytes = song.sizeBytes,
+                expiresSec = exp
+            )
+        }
+        writeAll(byId.values.toList())
+    }
+
+    fun remove(ids: Set<Long>) {
+        if (ids.isEmpty()) return
+        writeAll(readAll().filterNot { it.id in ids })
+    }
+}
+
 /** Audio files that are currently in the system trash. Empty below Android 11. */
 fun loadTrashedSongs(context: Context): List<TrashedSong> {
     if (Build.VERSION.SDK_INT >= 30) {
@@ -358,7 +438,7 @@ fun loadTrashedSongs(context: Context): List<TrashedSong> {
             putString(ContentResolver.QUERY_ARG_SQL_SELECTION, "${MediaStore.Audio.Media.IS_MUSIC} != 0")
             putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_ONLY)
         }
-        context.contentResolver.query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, projection, args, null)?.use { c ->
+        try { context.contentResolver.query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, projection, args, null)?.use { c ->
             val idCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
             val nameCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
             val dataCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
@@ -381,7 +461,12 @@ fun loadTrashedSongs(context: Context): List<TrashedSong> {
                     )
                 )
             }
+        } } catch (_: Exception) {
+            // The system query failed; still show what the app's own log knows about.
         }
+        // Add what the app itself trashed but the system won't let it list (files of other apps).
+        val known = result.map { it.id }.toSet()
+        for (t in TrashLog(context).load()) if (t.id !in known) result.add(t)
         return result.sortedByDescending { it.expiresSec }
     }
     return emptyList()
@@ -806,6 +891,7 @@ fun AppRoot(lastCrash: String? = null) {
     ) { result ->
         if (result.resultCode == android.app.Activity.RESULT_OK) {
             val count = pendingDeleteIds.size
+            if (trashActive) TrashLog(context).add(allSongs.filter { it.id in pendingDeleteIds })
             recordFreed(pendingDeleteIds)
             removeIds(pendingDeleteIds)
             if (trashActive) {
@@ -837,6 +923,7 @@ fun AppRoot(lastCrash: String? = null) {
             } else {
                 toast("$n קבצים נמחקו לצמיתות")
             }
+            TrashLog(context).remove(ids)
             trashed = trashed.filterNot { it.id in ids }
             trashSelected = trashSelected - ids
             refreshTrash()
