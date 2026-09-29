@@ -1,4 +1,4 @@
-@file:OptIn(ExperimentalMaterial3Api::class)
+@file:OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 
 package com.example.duplicatesongs
 
@@ -28,6 +28,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -1661,10 +1663,8 @@ private fun ResultsScreen(
                     )
                 }
                 item(key = "sort") {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         SortMode.values().forEach { mode ->
@@ -1679,12 +1679,10 @@ private fun ResultsScreen(
             }
 
             item(key = "actions") {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     OutlinedButton(
                         onClick = { onSetSelected(if (allShownSelected) selected - shownIds else selected + shownIds) },
@@ -1748,8 +1746,8 @@ private fun ResultsScreen(
                         }
                         val groupIds = group.map { it.id }.toSet()
                         val groupAllSelected = selected.containsAll(groupIds)
-                        Row(
-                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
                             TextButton(onClick = {
@@ -1759,8 +1757,12 @@ private fun ResultsScreen(
                                 val others = group.filter { it.id != best?.id }.map { it.id }
                                 onSetSelected(selected + others)
                             }) { Text("השאר רק את הטוב ביותר") }
-                            TextButton(onClick = { onMark(group) }) { Text("לא כפולים") }
                         }
+                        // Always-visible button (previously hidden inside the horizontally scrolling row).
+                        OutlinedButton(
+                            onClick = { onMark(group) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("סמן כ\"לא כפולים\" (לא יזוהו שוב בסריקות)") }
                         group.forEach { song ->
                             val details = buildString {
                                 append(formatDuration(song.durationSec))
