@@ -237,6 +237,9 @@ fun normalizeTitle(raw: String): String {
     var s = raw.substringBeforeLast('.', raw) // drop extension if present
     s = Normalizer.normalize(s, Normalizer.Form.NFD).replace(Regex("\\p{Mn}+"), "")
     s = s.lowercase()
+    // Leading track numbers ("01 - ", "12. ") and trailing "copy" markers.
+    s = s.replace(Regex("^\\s*\\d{1,3}\\s*[-_.)]\\s+"), "")
+    s = s.replace(Regex("(\\s|_|-)+(copy|copy \\d+)\\s*$"), "")
     // Braces are escaped because Android's regex engine treats an unescaped { or }
     // as a quantifier and throws a syntax error.
     s = s.replace(Regex("\\([^)]*\\)"), " ")   // ( ... )
@@ -267,11 +270,25 @@ fun levenshtein(a: String, b: String): Int {
     return prev[n]
 }
 
+/** Levenshtein-based similarity in the range 0..1. */
 fun similarity(a: String, b: String): Double {
-    if (a.isEmpty() && b.isEmpty()) return 1.0
-    val dist = levenshtein(a, b)
-    return 1.0 - dist.toDouble() / max(max(a.length, b.length), 1)
+    if (a == b) return 1.0
+    if (a.isEmpty() || b.isEmpty()) return 0.0
+    return 1.0 - levenshtein(a, b).toDouble() / max(a.length, b.length)
 }
+
+/** Word-order-insensitive similarity ("artist - song" vs "song - artist"). */
+fun tokenSimilarity(a: String, b: String): Double {
+    val ta = a.split(' ').filter { it.isNotEmpty() }.toSet()
+    val tb = b.split(' ').filter { it.isNotEmpty() }.toSet()
+    if (ta.size < 2 || tb.size < 2) return 0.0
+    val inter = ta.intersect(tb).size
+    return inter.toDouble() / ta.union(tb).size
+}
+
+/** Final match score: the better of character-level and word-level similarity. */
+fun matchScore(a: String, b: String): Double =
+    max(similarity(a, b), if (tokenSimilarity(a, b) >= 0.99) 1.0 else 0.0)
 
 // ---------- Union-Find for transitive grouping ----------
 
@@ -497,7 +514,8 @@ fun findDuplicateGroups(
         for (q in p + 1 until order.size) {
             val j = order[q]
             if (songs[j].durationSec - songs[i].durationSec > durationToleranceSec) break
-            if (similarity(songs[i].norm, songs[j].norm) < simThreshold) continue
+            if (songs[i].norm.isEmpty() || songs[j].norm.isEmpty()) continue
+            if (matchScore(songs[i].norm, songs[j].norm) < simThreshold) continue
             if (notDuplicates.isNotEmpty() &&
                 notDuplicates.contains(canonPair(songs[i].fingerprint, songs[j].fingerprint))
             ) continue
@@ -576,10 +594,16 @@ fun formatSize(bytes: Long): String = when {
  * For each group, marks all songs EXCEPT the "best" one (largest file = usually best
  * quality) for deletion. Returns the set of song ids to delete.
  */
+/** The copy worth keeping: highest bitrate, then biggest file, then shortest path (usually the original). */
+fun bestOf(group: List<Song>): Song? =
+    group.maxWithOrNull(
+        compareBy<Song>({ it.bitrateKbps }, { it.sizeBytes }, { -it.path.length })
+    )
+
 fun autoSelectDuplicates(groups: List<List<Song>>): Set<Long> {
     val toDelete = HashSet<Long>()
     for (group in groups) {
-        val keep = group.maxByOrNull { it.sizeBytes } ?: continue
+        val keep = bestOf(group) ?: continue
         for (song in group) if (song.id != keep.id) toDelete.add(song.id)
     }
     return toDelete
@@ -1787,7 +1811,7 @@ private fun ResultsScreen(
 
             item(key = "hint") {
                 Text(
-                    "⭐ = הקובץ הגדול ביותר (בדרך כלל האיכות הטובה ביותר). הקש על שיר כדי לנגן ולוודא.",
+                    "⭐ = העותק המומלץ להשארה (קצב סיביות גבוה, ואז גודל). הקש על שיר כדי לנגן ולוודא.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1812,7 +1836,7 @@ private fun ResultsScreen(
             }
 
             itemsIndexed(shown) { index, group ->
-                val best = group.maxByOrNull { it.sizeBytes }
+                val best = bestOf(group)
                 val sizeCounts = group.groupingBy { it.sizeBytes }.eachCount()
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -1829,6 +1853,8 @@ private fun ResultsScreen(
                                 color = MaterialTheme.colorScheme.primary,
                                 modifier = Modifier.weight(1f)
                             )
+                            bestOf(group)?.takeIf { it.bitrateKbps > 0 }?.let { Pill("${it.bitrateKbps} kbps") }
+                            Spacer(Modifier.width(6.dp))
                             Pill("~${formatSize(wastedBytes(group))}")
                         }
                         val groupIds = group.map { it.id }.toSet()
