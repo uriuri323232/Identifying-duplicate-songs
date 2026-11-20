@@ -40,6 +40,24 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.filled.CleaningServices
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Insights
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.ViewAgenda
+import androidx.compose.material3.SmallFloatingActionButton
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -310,7 +328,7 @@ class UnionFind(n: Int) {
 
 // ---------- MediaStore query ----------
 
-fun loadSongs(context: Context): List<Song> {
+fun loadSongs(context: Context, folder: String? = null): List<Song> {
     val songs = mutableListOf<Song>()
     val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
     val projection = arrayOf(
@@ -336,8 +354,19 @@ fun loadSongs(context: Context): List<Song> {
             songs.add(Song(id, name, path, durMs / 1000, size, normalizeTitle(name)))
         }
     }
-    return songs
+    if (folder.isNullOrBlank()) return songs
+    // Scan only inside the chosen folder (including its sub-folders).
+    val prefix = folder.trimEnd('/') + "/"
+    return songs.filter { it.path.startsWith(prefix) }
 }
+
+/** All folders that contain songs, with the number of songs in each. */
+fun loadFolders(context: Context): List<Pair<String, Int>> =
+    loadSongs(context)
+        .groupBy { it.folder }
+        .filterKeys { it.isNotEmpty() }
+        .map { Pair(it.key, it.value.size) }
+        .sortedBy { it.first.lowercase() }
 
 // ---------- Trash (Android 11+ MediaStore trash) ----------
 
@@ -760,6 +789,112 @@ private fun Pill(text: String) {
 }
 
 @Composable
+private fun SectionTitle(icon: androidx.compose.ui.graphics.vector.ImageVector, text: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            modifier = Modifier
+                .size(30.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.secondaryContainer),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSecondaryContainer, modifier = Modifier.size(18.dp))
+        }
+        Spacer(Modifier.width(10.dp))
+        Text(text, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun StatTile(value: String, label: String, modifier: Modifier = Modifier) {
+    Surface(modifier = modifier, shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.primaryContainer) {
+        Column(Modifier.padding(vertical = 10.dp, horizontal = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(value, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer)
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
+                textAlign = TextAlign.Center
+            )
+        }
+    }
+}
+
+@Composable
+private fun CreditFooter() {
+    Text(
+        "קרדיט: יהודי לא פשוט@ מתמחים טופ",
+        modifier = Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 4.dp),
+        textAlign = TextAlign.Center,
+        fontSize = 10.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+    )
+}
+
+@Composable
+private fun FolderPickerDialog(onDismiss: () -> Unit, onPick: (String?) -> Unit) {
+    val context = LocalContext.current
+    var folders by remember { mutableStateOf<List<Pair<String, Int>>?>(null) }
+    var filter by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) { folders = withContext(Dispatchers.IO) { loadFolders(context) } }
+    val shownFolders = remember(folders, filter) {
+        folders?.filter { filter.isBlank() || it.first.contains(filter, ignoreCase = true) } ?: emptyList()
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("בחירת תיקייה לסריקה") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = filter,
+                    onValueChange = { filter = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    placeholder = { Text("חיפוש תיקייה...") },
+                    leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+                    shape = RoundedCornerShape(14.dp)
+                )
+                Spacer(Modifier.height(8.dp))
+                when {
+                    folders == null -> LinearProgressIndicator(Modifier.fillMaxWidth())
+                    shownFolders.isEmpty() -> Text("לא נמצאו תיקיות", style = MaterialTheme.typography.bodyMedium)
+                    else -> LazyColumn(Modifier.heightIn(max = 380.dp)) {
+                        items(shownFolders) { fc ->
+                            Column(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onPick(fc.first) }
+                                    .padding(vertical = 8.dp)
+                            ) {
+                                Text(
+                                    fc.first.substringAfterLast('/').ifEmpty { fc.first } + " · ${fc.second} שירים",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    fc.first,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            HorizontalDivider()
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { onPick(null) }) { Text("כל המכשיר") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("סגור") } }
+    )
+}
+
+private fun groupLetter(g: List<Song>): String {
+    val t = (g.firstOrNull()?.title ?: "").trim()
+    val c = t.firstOrNull { it.isLetterOrDigit() } ?: return "#"
+    return if (c.isDigit()) "#" else c.uppercaseChar().toString()
+}
+
+@Composable
 private fun SectionCard(content: @Composable () -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -804,6 +939,7 @@ fun AppRoot(lastCrash: String? = null) {
     var hasPermission by remember { mutableStateOf(hasAudioPermission(context)) }
     var simThreshold by remember { mutableStateOf(prefs.sim) }
     var durTolerance by remember { mutableStateOf(prefs.tol) }
+    var scanFolder by remember { mutableStateOf<String?>(null) }
     var lastSim by remember { mutableStateOf(0.8) }
     var lastTol by remember { mutableStateOf(3L) }
     var useTrash by remember { mutableStateOf(prefs.useTrash) }
@@ -991,9 +1127,13 @@ fun AppRoot(lastCrash: String? = null) {
         scanPhase = "טוען את ספריית השירים..."
         val sim = simThreshold.toDouble()
         val tol = durTolerance.toLong()
+        val folder = scanFolder
         scope.launch {
             try {
-                val songs = withContext(Dispatchers.IO) { loadSongs(context) }
+                val songs = withContext(Dispatchers.IO) { loadSongs(context, folder) }
+                if (folder != null && songs.isEmpty()) {
+                    errorMsg = "לא נמצאו שירים בתיקייה שנבחרה"
+                }
 
                 scanPhase = "משווה שירים..."
                 scanProgress = 0f
@@ -1305,7 +1445,9 @@ fun AppRoot(lastCrash: String? = null) {
             onOpenTrash = { openTrash() },
             onShowResults = { screen = Screen.Results },
             onShowIgnored = { screen = Screen.Ignored },
-            onAbout = { screen = Screen.About }
+            onAbout = { screen = Screen.About },
+            scanFolder = scanFolder,
+            onScanFolder = { scanFolder = it }
         )
 
         Screen.Results -> ResultsScreen(
@@ -1399,8 +1541,17 @@ private fun ScanScreen(
     onShowIgnored: () -> Unit,
     onAbout: () -> Unit,
     freedBytes: Long,
-    freedCount: Int
+    freedCount: Int,
+    scanFolder: String?,
+    onScanFolder: (String?) -> Unit
 ) {
+    var showFolderPicker by remember { mutableStateOf(false) }
+    if (showFolderPicker) {
+        FolderPickerDialog(
+            onDismiss = { showFolderPicker = false },
+            onPick = { onScanFolder(it); showFolderPicker = false }
+        )
+    }
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
         topBar = {
@@ -1426,6 +1577,14 @@ private fun ScanScreen(
                     .background(Brush.linearGradient(listOf(Color(0xFF1F8A70), Color(0xFF0B3D5C))))
                     .padding(20.dp)
             ) {
+                Box(
+                    Modifier
+                        .align(Alignment.TopStart)
+                        .offset(x = (-44).dp, y = (-44).dp)
+                        .size(120.dp)
+                        .clip(CircleShape)
+                        .background(Color.White.copy(alpha = 0.08f))
+                )
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     AppLogo(logoSize = 64.dp)
                     Spacer(Modifier.width(16.dp))
@@ -1451,12 +1610,47 @@ private fun ScanScreen(
                     Spacer(Modifier.height(12.dp))
                     Button(onClick = onRequestPermission, modifier = Modifier.fillMaxWidth()) { Text("אישור הרשאה") }
                 }
+                CreditFooter()
                 return@Column
+            }
+
+            // Scan scope (whole device or one specific folder)
+            SectionCard {
+                SectionTitle(Icons.Filled.Folder, "טווח הסריקה")
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    if (scanFolder == null) "כל השירים במכשיר" else scanFolder,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Medium
+                )
+                if (scanFolder != null) {
+                    Text(
+                        "כולל תת-תיקיות",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(
+                        onClick = { showFolderPicker = true },
+                        enabled = !scanning,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Filled.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (scanFolder == null) "בחר תיקייה" else "החלף תיקייה")
+                    }
+                    if (scanFolder != null) {
+                        TextButton(onClick = { onScanFolder(null) }, enabled = !scanning) { Text("כל המכשיר") }
+                    }
+                }
             }
 
             // Sensitivity
             SectionCard {
-                Text("רגישות הסריקה", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                SectionTitle(Icons.Filled.Tune, "רגישות הסריקה")
                 Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     PRESETS.forEach { p ->
@@ -1502,7 +1696,9 @@ private fun ScanScreen(
             ) {
                 Icon(Icons.Filled.Search, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
-                Text(if (scanning) "סורק..." else "סרוק את המכשיר", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    if (scanning) "סורק..." else if (scanFolder != null) "סרוק את התיקייה" else "סרוק את המכשיר",
+                    style = MaterialTheme.typography.titleMedium)
             }
 
             if (scanning) {
@@ -1529,12 +1725,12 @@ private fun ScanScreen(
 
             if (hasScanned && !scanning) {
                 SectionCard {
-                    Text("תוצאות הסריקה האחרונה", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Spacer(Modifier.height(8.dp))
+                    SectionTitle(Icons.Filled.Insights, "תוצאות הסריקה האחרונה")
+                    Spacer(Modifier.height(10.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Pill("$songsCount שירים")
-                        Pill("$groupsCount קבוצות")
-                        if (wasted > 0) Pill("~${formatSize(wasted)} לפינוי")
+                        StatTile("$songsCount", "שירים", Modifier.weight(1f))
+                        StatTile("$groupsCount", "קבוצות כפולים", Modifier.weight(1f))
+                        if (wasted > 0) StatTile("~${formatSize(wasted)}", "לפינוי", Modifier.weight(1f))
                     }
                     Spacer(Modifier.height(12.dp))
                     if (groupsCount > 0) {
@@ -1547,7 +1743,7 @@ private fun ScanScreen(
 
             if (freedCount > 0) {
                 SectionCard {
-                    Text("סה״כ נוקו עד היום", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    SectionTitle(Icons.Filled.CleaningServices, "סה״כ נוקו עד היום")
                     Spacer(Modifier.height(4.dp))
                     Text(
                         "$freedCount קבצים · ${formatSize(freedBytes)}",
@@ -1570,6 +1766,8 @@ private fun ScanScreen(
                     Text("שירים שסימנת כ\"לא כפולים\" ($ignoredCount)")
                 }
             }
+
+            CreditFooter()
         }
     }
 }
@@ -1604,6 +1802,10 @@ private fun ResultsScreen(
     var query by remember { mutableStateOf("") }
     var sortMode by remember { mutableStateOf(SortMode.BY_WASTE) }
     var showFolders by remember { mutableStateOf(false) }
+    var compact by remember { mutableStateOf(false) }
+    val listState = rememberLazyListState()
+    val listScope = rememberCoroutineScope()
+    val showTop by remember { derivedStateOf { listState.firstVisibleItemIndex > 3 } }
 
     val shown = remember(groups, query, sortMode) {
         val filtered = if (query.isBlank()) groups
@@ -1681,6 +1883,13 @@ private fun ResultsScreen(
                 }
             })
         },
+        floatingActionButton = {
+            if (showTop) {
+                SmallFloatingActionButton(onClick = { listScope.launch { listState.animateScrollToItem(0) } }) {
+                    Icon(Icons.Filled.KeyboardArrowUp, contentDescription = "חזרה למעלה")
+                }
+            }
+        },
         bottomBar = {
             // The bottom bar only appears once something is selected, so the list gets the whole screen.
             if (selected.isNotEmpty()) {
@@ -1718,9 +1927,10 @@ private fun ResultsScreen(
     ) { padding ->
         // Everything (summary, search, sort, actions) lives INSIDE the list and scrolls away,
         // so the song groups can use the full height of the screen.
+        Box(Modifier.padding(padding).fillMaxSize()) {
         LazyColumn(
+            state = listState,
             modifier = Modifier
-                .padding(padding)
                 .fillMaxSize()
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -1785,6 +1995,12 @@ private fun ResultsScreen(
                                 label = { Text(mode.label) }
                             )
                         }
+                        FilterChip(
+                            selected = compact,
+                            onClick = { compact = !compact },
+                            label = { Text("תצוגה קומפקטית") },
+                            leadingIcon = { Icon(Icons.Filled.ViewAgenda, contentDescription = null, modifier = Modifier.size(18.dp)) }
+                        )
                     }
                 }
             }
@@ -1859,7 +2075,7 @@ private fun ResultsScreen(
                         }
                         val groupIds = group.map { it.id }.toSet()
                         val groupAllSelected = selected.containsAll(groupIds)
-                        FlowRow(
+                        if (!compact) FlowRow(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
@@ -1872,7 +2088,7 @@ private fun ResultsScreen(
                             }) { Text("השאר רק את הטוב ביותר") }
                         }
                         // Always-visible button (previously hidden inside the horizontally scrolling row).
-                        OutlinedButton(
+                        if (!compact) OutlinedButton(
                             onClick = { onMark(group) },
                             modifier = Modifier.fillMaxWidth()
                         ) { Text("סמן כ\"לא כפולים\" (לא יזוהו שוב בסריקות)") }
@@ -1903,12 +2119,12 @@ private fun ResultsScreen(
                                         style = MaterialTheme.typography.bodyMedium,
                                         fontWeight = FontWeight.Medium
                                     )
-                                    Text(
+                                    if (!compact) Text(
                                         details,
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
-                                    Text(
+                                    if (!compact) Text(
                                         song.path,
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1935,6 +2151,67 @@ private fun ResultsScreen(
                     }
                 }
             }
+        }
+
+        // Fast-scroll strip: tap or drag along the letters to jump through the results.
+        val letters = remember(shown) { shown.map { groupLetter(it) }.distinct().sorted() }
+        if (shown.size >= 8 && letters.size >= 2) {
+            val headerCount = 1 +
+                (if (trashSupported && trashCount > 0) 1 else 0) +
+                (if (groups.isNotEmpty()) 2 else 0) + 2
+            var stripHeight by remember { mutableStateOf(1) }
+            var activeLetter by remember { mutableStateOf<String?>(null) }
+            fun jump(letter: String) {
+                val idx = shown.indexOfFirst { groupLetter(it) == letter }
+                if (idx >= 0) listScope.launch { listState.scrollToItem(headerCount + idx) }
+            }
+            fun jumpAt(y: Float) {
+                val i = ((y / stripHeight) * letters.size).toInt().coerceIn(0, letters.size - 1)
+                val l = letters[i]
+                if (l != activeLetter) { activeLetter = l; jump(l) }
+            }
+            Column(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .fillMaxHeight(0.7f)
+                    .width(22.dp)
+                    .clip(RoundedCornerShape(11.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.85f))
+                    .onSizeChanged { stripHeight = it.height.coerceAtLeast(1) }
+                    .pointerInput(letters) {
+                        detectVerticalDragGestures(
+                            onDragStart = { off -> jumpAt(off.y) },
+                            onVerticalDrag = { change, _ -> jumpAt(change.position.y) },
+                            onDragEnd = { activeLetter = null },
+                            onDragCancel = { activeLetter = null }
+                        )
+                    },
+                verticalArrangement = Arrangement.SpaceEvenly,
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                letters.forEach { l ->
+                    Text(
+                        l,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.clickable { jump(l) }
+                    )
+                }
+            }
+            activeLetter?.let { l ->
+                Box(
+                    Modifier
+                        .align(Alignment.Center)
+                        .size(64.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.primary),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(l, color = MaterialTheme.colorScheme.onPrimary, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
         }
     }
 }
